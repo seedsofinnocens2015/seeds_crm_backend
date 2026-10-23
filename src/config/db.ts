@@ -43,14 +43,13 @@ export async function connectDB(): Promise<typeof mongoose | null> {
 
   try {
     const conn = await mongoose.connect(config.mongodbUri, {
-      bufferCommands: false,
-      serverSelectionTimeoutMS: 3000, // Short timeout so it doesn't block server startup
+      bufferCommands: true,
+      serverSelectionTimeoutMS: 10000,
     });
     console.log(`[Database] MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
     return conn;
   } catch (error: any) {
-    console.warn(`[Database] MongoDB connection warning: ${error.message}`);
-    // Non-fatal: Server continues running and reports database status via /health
+    console.error(`[Database] MongoDB connection failed: ${error.message}`);
     return null;
   }
 }

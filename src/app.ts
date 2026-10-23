@@ -7,6 +7,9 @@ import apiRouter from "./routes/index.js";
 
 const app = express();
 
+// Trust reverse proxy (Hostinger, Nginx, Cloudflare) for accurate client IP in rate limiting & headers
+app.set("trust proxy", 1);
+
 // Standard Security & Parsing Middlewares
 app.use(
   cors({

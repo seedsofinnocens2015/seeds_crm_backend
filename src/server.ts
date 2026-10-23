@@ -6,10 +6,12 @@ import { connectDB, disconnectDB } from "./config/db.js";
 const server = http.createServer(app);
 
 async function startServer() {
-  // Attempt database connection in background (non-blocking for HTTP start)
-  connectDB().catch((err) => {
-    console.warn(`[Startup] Initial MongoDB connection failed: ${err.message}`);
-  });
+  // Connect to database before accepting incoming requests
+  try {
+    await connectDB();
+  } catch (err: any) {
+    console.error(`[Startup] Initial MongoDB connection error: ${err.message}`);
+  }
 
   server.listen(config.port, () => {
     console.log(`[Server] seeds-crm-backend running on port ${config.port} in ${config.nodeEnv} mode`);
