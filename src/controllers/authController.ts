@@ -166,30 +166,6 @@ export async function signupAdmin(req: Request, res: Response) {
       return res.status(400).json({ error: "A user with this email already exists." });
     }
 
-    // Check if an admin already exists in the system
-    const existingAdminCount = await User.countDocuments({ role: "admin" });
-    if (existingAdminCount > 0) {
-      // If admins already exist, registration requires an existing admin session
-      let token = req.cookies?.token;
-      if (!token && req.headers.authorization?.startsWith("Bearer ")) {
-        token = req.headers.authorization.split(" ")[1];
-      }
-
-      let callerIsAdmin = false;
-      if (token) {
-        try {
-          const decoded = jwt.verify(token, config.jwtSecret) as any;
-          if (decoded.role === "admin") callerIsAdmin = true;
-        } catch {}
-      }
-
-      if (!callerIsAdmin) {
-        return res.status(403).json({
-          error: "Admin account creation is restricted. An existing administrator must perform this action.",
-        });
-      }
-    }
-
     // Hash password
     const hashedPassword = await bcrypt.hash(String(password), 10);
 
