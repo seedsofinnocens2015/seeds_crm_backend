@@ -45,6 +45,9 @@ export async function connectDB(): Promise<typeof mongoose | null> {
     const conn = await mongoose.connect(config.mongodbUri, {
       bufferCommands: true,
       serverSelectionTimeoutMS: 10000,
+      maxPoolSize: 100, // Handle high concurrent queries for 300+ active members
+      minPoolSize: 10,  // Maintain warm connection pool
+      socketTimeoutMS: 45000,
     });
     console.log(`[Database] MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
     return conn;

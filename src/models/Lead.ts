@@ -325,14 +325,19 @@ const LeadSchema = new Schema<ILead>(
   { timestamps: true, strict: false }
 );
 
-// High-Performance Query & Sorting Indexes preserved exactly from frontend
+// High-Performance Query & Sorting Indexes for 15+ Lakh (1.5M+) Leads
 LeadSchema.index({ createdAt: -1 });
 LeadSchema.index({ callerName: 1, createdAt: -1 });
+LeadSchema.index({ month: 1, location: 1 });
+LeadSchema.index({ appointmentDate: 1 });
+LeadSchema.index({ surgeryDate: 1 });
 LeadSchema.index({ followUpDate: 1 });
 LeadSchema.index({ date: 1 });
 LeadSchema.index({ location: 1 });
 LeadSchema.index({ dispositions: 1 });
 LeadSchema.index({ subDispositions: 1 });
+LeadSchema.index({ leadSource: 1 });
+LeadSchema.index({ patientName: "text", mobileNumber: "text" });
 
 export const Lead: Model<ILead> =
   mongoose.models.Lead || mongoose.model<ILead>("Lead", LeadSchema);
