@@ -83,31 +83,36 @@ export async function getLeads(req: Request, res: Response) {
       return res.status(200).json({ leads, totalCount: leads.length });
     }
 
-    // Bounded Pagination Parameters: default 50, maximum 200. Never allow uncapped limit=0 or limit=all
+    // Pagination Parameters: default 10,000 when no limit specified (for complete CRM tables & filters), or bounded if specified
     let page = parseInt(pageParam || "1", 10);
     if (isNaN(page) || page < 1) {
       page = 1;
     }
 
-    let limit = 50; // default safe page size
+    let limit = 10000; // default large limit to return all leads for client-side filtering and pagination
     if (limitParam !== undefined && limitParam !== null && limitParam !== "") {
-      const parsedLimit = parseInt(limitParam, 10);
-      if (!isNaN(parsedLimit) && parsedLimit > 0) {
-        limit = Math.min(parsedLimit, 200); // hard cap at 200
+      if (limitParam.toLowerCase() === "all" || limitParam === "0") {
+        limit = 0; // return all
+      } else {
+        const parsedLimit = parseInt(limitParam, 10);
+        if (!isNaN(parsedLimit) && parsedLimit > 0) {
+          limit = parsedLimit;
+        }
       }
     }
 
-    const skip = (page - 1) * limit;
+    const skip = limit > 0 ? (page - 1) * limit : 0;
 
-    let leadQuery = Lead.find(query)
+    let queryBuilder = Lead.find(query)
       .select(TABLE_VIEW_PROJECTION)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+      .sort({ createdAt: -1 });
+
+    if (limit > 0) {
+      queryBuilder = queryBuilder.skip(skip).limit(limit);
+    }
 
     const [leads, totalCount, nextUniqueId] = await Promise.all([
-      leadQuery,
+      queryBuilder.lean(),
       Lead.countDocuments(query),
       getNextUniqueId(),
     ]);
