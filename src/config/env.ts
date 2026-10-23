@@ -30,14 +30,14 @@ export const config: AppConfig = {
   nodeEnv: (process.env.NODE_ENV as "development" | "production" | "test") || "development",
   mongodbUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/seeds_crm_dev",
   jwtSecret: process.env.JWT_SECRET || "seeds_crm_dev_fallback_secret",
-  corsOrigin: (process.env.CORS_ORIGIN || "http://localhost:3000")
+  corsOrigin: (process.env.CORS_ORIGIN || "http://localhost:3000,https://seedscrm.seedsofinnocens.com")
     .split(",")
     .map((origin) => origin.trim()),
   metaAppId: process.env.META_APP_ID || "",
   metaAppSecret: process.env.META_APP_SECRET || "",
   metaWebhookVerifyToken: process.env.META_WEBHOOK_VERIFY_TOKEN || "",
   metaOAuthRedirectUri:
-    process.env.META_OAUTH_REDIRECT_URI || "http://localhost:3000/admin/integrations/meta/callback",
+    process.env.META_OAUTH_REDIRECT_URI || "https://seedscrm.seedsofinnocens.com/admin/integrations/meta/callback",
   metaPageAccessToken: process.env.META_PAGE_ACCESS_TOKEN || "",
   metaGraphApiVersion: process.env.META_GRAPH_API_VERSION || "v21.0",
 };
