@@ -472,7 +472,7 @@ export async function ingestMetaLead(
     }
   }
 
-  // 5. Create New Lead with atomic sequential SC-<number> ID
+  // 5. Create New Lead with atomic sequential SOI-<number> ID
   const nextUniqueId = await getNextUniqueId();
   mappedFields.uniqueId = nextUniqueId;
 

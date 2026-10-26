@@ -3,6 +3,13 @@ import { FormConfig } from "../models/FormConfig.js";
 import { DEFAULT_FORM_FIELDS } from "../utils/defaultFormFields.js";
 import { SUB_DISPOSITIONS_MAP } from "../utils/dateUtils.js";
 
+const DEFAULT_SECTIONS = [
+  { id: 1 as const, title: "1. Lead Identification & Overview" },
+  { id: 2 as const, title: "2. Couple Profile & Medical Details" },
+  { id: 3 as const, title: "3. Contact & Address Information" },
+  { id: 4 as const, title: "4. Disposition, Centre, Visits & Registration" },
+];
+
 /**
  * GET /api/v1/form-config
  * Fetches dynamic form configuration, initializing defaults if none exist.
@@ -13,23 +20,43 @@ export async function getFormConfig(req: Request, res: Response) {
 
     if (!config) {
       const created = await FormConfig.create({
-        version: 1,
-        sections: [
-          { id: 1, title: "1. Lead Date, Contact & Caller" },
-          { id: 2, title: "2. Patient & Family Profile" },
-          { id: 3, title: "3. Clinical & Surgical Information" },
-          { id: 4, title: "4. Disposition, Appointments & Follow-up" },
-        ],
+        version: 2,
+        sections: DEFAULT_SECTIONS,
         fields: DEFAULT_FORM_FIELDS,
         subDispositionMappings: { ...SUB_DISPOSITIONS_MAP },
         updatedBy: "System Default",
       });
       config = created.toObject();
-    } else if (
-      !config.subDispositionMappings ||
-      Object.keys(config.subDispositionMappings).length === 0
-    ) {
-      config.subDispositionMappings = { ...SUB_DISPOSITIONS_MAP };
+    } else {
+      let needsSave = false;
+      // Auto upgrade if config has older subDispositionMappings or missing new fields
+      const hasLatestSubStatus = config.subDispositionMappings && config.subDispositionMappings["Visited Centre"];
+      const hasNewFields = config.fields && config.fields.some((f: any) => f.id === "husbandName" || f.id === "wifeName");
+      
+      if (!hasLatestSubStatus || !hasNewFields) {
+        config.fields = DEFAULT_FORM_FIELDS;
+        config.sections = DEFAULT_SECTIONS;
+        config.subDispositionMappings = { ...SUB_DISPOSITIONS_MAP };
+        config.version = (config.version || 1) + 1;
+        needsSave = true;
+      } else if (
+        !config.subDispositionMappings ||
+        Object.keys(config.subDispositionMappings).length === 0
+      ) {
+        config.subDispositionMappings = { ...SUB_DISPOSITIONS_MAP };
+        needsSave = true;
+      }
+
+      if (needsSave) {
+        await FormConfig.findByIdAndUpdate(config._id, {
+          $set: {
+            fields: config.fields,
+            sections: config.sections,
+            subDispositionMappings: config.subDispositionMappings,
+            version: config.version,
+          },
+        });
+      }
     }
 
     return res.status(200).json({ config });
@@ -113,17 +140,13 @@ export async function resetFormConfig(req: Request, res: Response) {
     if (!config) {
       config = new FormConfig({
         version: 1,
-        sections: [
-          { id: 1, title: "1. Lead Date, Contact & Caller" },
-          { id: 2, title: "2. Patient & Family Profile" },
-          { id: 3, title: "3. Clinical & Surgical Information" },
-          { id: 4, title: "4. Disposition, Appointments & Follow-up" },
-        ],
+        sections: DEFAULT_SECTIONS,
         fields: DEFAULT_FORM_FIELDS,
         subDispositionMappings: { ...SUB_DISPOSITIONS_MAP },
         updatedBy: `Reset by ${session.name || "Admin"}`,
       });
     } else {
+      config.sections = DEFAULT_SECTIONS;
       config.fields = DEFAULT_FORM_FIELDS;
       config.subDispositionMappings = { ...SUB_DISPOSITIONS_MAP };
       config.version = (config.version || 1) + 1;

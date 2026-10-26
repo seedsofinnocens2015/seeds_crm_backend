@@ -6,10 +6,15 @@ import {
   getFormattedTimestamp,
   getTodayDDMMMYY,
   getCurrentMonthMMMYY,
+  calculateLeadAge,
+  calculateLeadScore,
   SUB_DISPOSITIONS_MAP,
+  CAMP_TO_CENTRE_MAP,
 } from "../utils/dateUtils.js";
 import { normalizePhoneNumber } from "../utils/phoneUtils.js";
-import { getNextUniqueId } from "../utils/idGenerator.js";
+import {
+  getNextUniqueId,
+  } from "../utils/idGenerator.js";
 import { invalidateDashboardCache } from "../utils/cacheInvalidation.js";
 
 // Projection for table view: excludes heavy auditLogs and notesHistory
@@ -21,7 +26,7 @@ const TABLE_VIEW_PROJECTION = {
 /**
  * GET /api/v1/leads
  * Server-side pagination, projection, and role-based filtering.
- * Agents are strictly restricted to leads assigned to their callerName.
+ * Agents are strictly restricted to leads assigned to their callerName / leadOwner.
  */
 export async function getLeads(req: Request, res: Response) {
   const startTime = Date.now();
@@ -35,10 +40,12 @@ export async function getLeads(req: Request, res: Response) {
     let query: any = {};
     if (session.role === "agent") {
       const agentName = (session.name || "").trim();
+      const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       query = {
-        callerName: {
-          $regex: new RegExp(`^${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-        },
+        $or: [
+          { callerName: { $regex: new RegExp(`^${escaped}$`, "i") } },
+          { leadOwner: { $regex: new RegExp(`^${escaped}$`, "i") } },
+        ],
       };
     }
 
@@ -47,32 +54,33 @@ export async function getLeads(req: Request, res: Response) {
       const dashboardProjection = {
         uniqueId: 1,
         patientName: 1,
+        wifeName: 1,
+        husbandName: 1,
+        primaryMobileNumber: 1,
         mobileNumber: 1,
         callerName: 1,
+        leadOwner: 1,
         month: 1,
         date: 1,
+        createdOn: 1,
+        firstActivityDate: 1,
         appointmentMonth: 1,
         appointmentDate: 1,
-        surgeryMonth: 1,
-        surgeryDate: 1,
-        surgeryCost: 1,
+        centreLocation: 1,
+        campLocation: 1,
         location: 1,
-        otherCity: 1,
-        lookingForTreatment: 1,
-        teleconsultationSlot: 1,
-        assignedDate: 1,
-        assignedAt: 1,
-        createdAt: 1,
-        followUpDate: 1,
-        followUpDates: 1,
+        subStatus: 1,
+        leadStage: 1,
+        leadValidStatus: 1,
+        subDispositions: 1,
         dispositions: 1,
         validStatus: 1,
-        consultationCharges: 1,
-        surgeryPaymentReceived: 1,
-        subDispositions: 1,
         leadSource: 1,
-        leadTimestamp: 1,
-        auditLogs: 1,
+        campaignName: 1,
+        source: 1,
+        followUpDateTime: 1,
+        followUpDate: 1,
+        createdAt: 1,
       };
 
       const leads = await Lead.find(query)
@@ -83,16 +91,16 @@ export async function getLeads(req: Request, res: Response) {
       return res.status(200).json({ leads, totalCount: leads.length });
     }
 
-    // Pagination Parameters: default 10,000 when no limit specified (for complete CRM tables & filters), or bounded if specified
+    // Pagination Parameters
     let page = parseInt(pageParam || "1", 10);
     if (isNaN(page) || page < 1) {
       page = 1;
     }
 
-    let limit = 10000; // default large limit to return all leads for client-side filtering and pagination
+    let limit = 10000;
     if (limitParam !== undefined && limitParam !== null && limitParam !== "") {
       if (limitParam.toLowerCase() === "all" || limitParam === "0") {
-        limit = 0; // return all
+        limit = 0;
       } else {
         const parsedLimit = parseInt(limitParam, 10);
         if (!isNaN(parsedLimit) && parsedLimit > 0) {
@@ -101,31 +109,37 @@ export async function getLeads(req: Request, res: Response) {
       }
     }
 
-    const skip = limit > 0 ? (page - 1) * limit : 0;
-
-    let queryBuilder = Lead.find(query)
-      .select(TABLE_VIEW_PROJECTION)
-      .sort({ createdAt: -1 });
-
-    if (limit > 0) {
-      queryBuilder = queryBuilder.skip(skip).limit(limit);
-    }
-
     const [leads, totalCount, nextUniqueId] = await Promise.all([
-      queryBuilder.lean(),
+      limit === 0
+        ? Lead.find(query)
+            .select(TABLE_VIEW_PROJECTION)
+            .sort({ createdAt: -1 })
+            .lean()
+        : Lead.find(query)
+            .select(TABLE_VIEW_PROJECTION)
+            .sort({ createdAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .lean(),
       Lead.countDocuments(query),
       getNextUniqueId(),
     ]);
 
-    const totalPages = limit > 0 ? Math.max(1, Math.ceil(totalCount / limit)) : 1;
+    // Dynamic real-time calculation of leadAge for each lead
+    const enrichedLeads = leads.map((l: any) => ({
+      ...l,
+      leadAge: calculateLeadAge(l.createdOn || l.createdAt || l.date),
+    }));
 
-    res.setHeader("X-Response-Time", `${Date.now() - startTime}ms`);
+    const duration = Date.now() - startTime;
+    res.setHeader("Server-Timing", `db;dur=${duration}`);
+
     return res.status(200).json({
-      leads,
+      leads: enrichedLeads,
       totalCount,
-      page,
-      limit: limit > 0 ? limit : totalCount,
-      totalPages,
+      page: limit === 0 ? 1 : page,
+      totalPages: limit === 0 ? 1 : Math.ceil(totalCount / limit),
+      limit,
       nextUniqueId,
     });
   } catch (error: any) {
@@ -137,8 +151,55 @@ export async function getLeads(req: Request, res: Response) {
 }
 
 /**
+ * GET /api/v1/leads/:id
+ * Fetches single lead document by uniqueId, or _id.
+ */
+export async function getLeadById(req: Request, res: Response) {
+  try {
+    const session = req.user!;
+    const { id } = req.params;
+
+    let query: any = {
+      $or: [
+        { uniqueId: id },
+        ],
+    };
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      query.$or.push({ _id: id });
+    }
+
+    const lead = await Lead.findOne(query).lean();
+    if (!lead) {
+      return res.status(404).json({ error: "Lead not found" });
+    }
+
+    // Role-based access control: agents can only view their own leads
+    if (session.role === "agent") {
+      const agentName = (session.name || "").trim().toLowerCase();
+      const leadCaller = (lead.callerName || "").trim().toLowerCase();
+      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
+      if (leadCaller !== agentName && leadOwner !== agentName) {
+        return res.status(403).json({
+          error: "Access denied. You can only view leads assigned to you.",
+        });
+      }
+    }
+
+    // Enrich real-time lead age
+    (lead as any).leadAge = calculateLeadAge(lead.createdOn || lead.createdAt || lead.date);
+
+    return res.status(200).json({ lead });
+  } catch (error: any) {
+    console.error("Error fetching lead:", error);
+    return res.status(500).json({
+      error: error.message || "Failed to fetch lead",
+    });
+  }
+}
+
+/**
  * POST /api/v1/leads
- * Lead creation with auto-unique ID, disposition cascading, and initial audit log.
+ * Creates a new lead with all mandated & auto-filled fields.
  */
 export async function createLead(req: Request, res: Response) {
   try {
@@ -147,88 +208,191 @@ export async function createLead(req: Request, res: Response) {
 
     let {
       uniqueId,
-      date,
-      month,
+      firstActivityDate,
+      husbandName,
+      wifeName,
+      husbandAge,
+      wifeAge,
+      whenPlanningToStartTreatment,
+      preMedicalConditions,
+      marriedSince,
+      tryingToConceiveYears,
+      primaryEmail,
+      secondaryEmail,
+      primaryMobileNumber,
+      secondaryMobileNumber,
+      whatsappMobileNumber,
+      otherNumbers,
+      whatsappConsent,
+      callingConsent,
+      leadSource,
+      utmSource,
+      campaignName,
+      sourceName,
+      source,
+      leadScore,
+      subStatus,
+      leadStage,
+      leadValidStatus,
+      centreAddress,
+      ptAddress,
+      ptPincode,
+      ptCountry,
+      ptState,
+      ptCity,
+      leadOwner,
+      campLocation,
+      centreLocation,
+      followUpDateTime,
+      centreVisitedDate,
+      campVisitedDate,
+      appointmentDate,
+      registrationStatus,
+      registrationNumber,
+      registrationAmount,
+      package: pkg,
+      plan,
+      notes,
+      customFields,
+      // Legacy fields
       mobileNumber,
       phoneNumber,
-      alternateNumber,
-      callerName,
       patientName,
       patientAge,
       spouseName,
       spouseAge,
+      callerName,
       location,
       otherCity,
       lookingForTreatment,
-      treatment,
       preConditions,
-      preCondition,
       surgeryDetails,
-      surgicalData,
       treatmentRequirements,
-      treatmentRequired,
       referredBy,
-      leadSource,
       followUpDate,
-      followUpDates,
       subDispositions,
-      subDisposition,
       dispositions,
-      disposition,
       validStatus,
-      appointmentDate,
-      appointmentMonth,
-      teleconsultationSlot,
-      appointmentSlot,
-      consultationCharges,
-      teleConsultationCharges,
-      notes,
-      surgeryPaymentReceived,
-      surgeryReceipt,
-      surgeryCost,
-      surgeryDate,
-      customFields,
     } = body;
 
-    const finalMobile = (mobileNumber || phoneNumber || "").trim();
-    if (!finalMobile) {
-      return res.status(400).json({ error: "Mobile number is required." });
+    // Field normalization: Primary Mobile Number
+    const finalPrimaryMobile = (primaryMobileNumber || mobileNumber || phoneNumber || "").trim();
+    if (!finalPrimaryMobile) {
+      return res.status(400).json({ error: "Primary Mobile number is mandatory." });
     }
 
-    const finalPatient = (patientName || "").trim();
-    if (!finalPatient) {
-      return res.status(400).json({ error: "Patient name is required." });
+    // Validation: Wife Name / Patient Name
+    const finalWife = (wifeName || patientName || "").trim();
+    if (!finalWife) {
+      return res.status(400).json({ error: "Wife Name is mandatory." });
     }
 
-    // Auto-generate unique ID if missing
-    if (!uniqueId || !uniqueId.trim()) {
-      uniqueId = await getNextUniqueId();
-    } else {
-      uniqueId = uniqueId.trim();
-      const existing = await Lead.findOne({ uniqueId });
-      if (existing) {
-        uniqueId = await getNextUniqueId();
+    // Validation: Husband Name
+    const finalHusband = (husbandName || spouseName || "").trim();
+    if (!finalHusband) {
+      return res.status(400).json({ error: "Husband Name is mandatory." });
+    }
+
+    // Validation: Ages (2 digits)
+    const finalHusbandAge = (husbandAge || spouseAge || "").toString().trim();
+    const finalWifeAge = (wifeAge || patientAge || "").toString().trim();
+    if (!finalHusbandAge || !/^\d{2}$/.test(finalHusbandAge)) {
+      return res.status(400).json({ error: "Husband Age is mandatory and must be a 2 digit number." });
+    }
+    if (!finalWifeAge || !/^\d{2}$/.test(finalWifeAge)) {
+      return res.status(400).json({ error: "Wife Age is mandatory and must be a 2 digit number." });
+    }
+
+    // Pre Medical Conditions (Mandate)
+    const finalPreMedical = (preMedicalConditions || preConditions || "No").trim();
+
+    // Married Since & Trying to conceive (Mandate Numbers only)
+    const finalMarriedSince = (marriedSince || "").toString().trim();
+    const finalTryingYears = (tryingToConceiveYears || "").toString().trim();
+    if (!finalMarriedSince) {
+      return res.status(400).json({ error: "Married Since is mandatory and should only be numbers." });
+    }
+    if (!finalTryingYears) {
+      return res.status(400).json({ error: "How long you are trying to conceive is mandatory and should only be numbers." });
+    }
+
+    // Centre Location & Camp Location auto-fill
+    let finalCampLocation = (campLocation || "").trim();
+    let finalCentreLocation = (centreLocation || location || otherCity || "").trim();
+    if (finalCampLocation && CAMP_TO_CENTRE_MAP[finalCampLocation]) {
+      if (!finalCentreLocation) {
+        finalCentreLocation = CAMP_TO_CENTRE_MAP[finalCampLocation];
       }
     }
-
-    // Agent role auto-assignment
-    if (session.role === "agent") {
-      callerName = (session.name || "").trim();
+    if (!finalCentreLocation) {
+      return res.status(400).json({ error: "Centre Location is mandatory." });
     }
 
-    // Auto-cascade subDispositions
-    const finalSubDisp = (subDispositions || subDisposition || "").trim();
-    let finalDisp = (dispositions || disposition || "").trim();
-    let finalValidStatus = (validStatus || "").trim();
-
-    if (finalSubDisp && SUB_DISPOSITIONS_MAP[finalSubDisp]) {
-      if (!finalDisp) finalDisp = SUB_DISPOSITIONS_MAP[finalSubDisp].disposition;
-      if (!finalValidStatus) finalValidStatus = SUB_DISPOSITIONS_MAP[finalSubDisp].validStatus;
+    // Sub Status -> Auto fills Lead Stage & Lead Valid Status
+    const finalSubStatus = (subStatus || subDispositions || "").trim();
+    if (!finalSubStatus) {
+      return res.status(400).json({ error: "Sub Status is mandatory." });
     }
 
+    let finalLeadStage = (leadStage || dispositions || "").trim();
+    let finalLeadValidStatus = (leadValidStatus || validStatus || "").trim();
+    if (SUB_DISPOSITIONS_MAP[finalSubStatus]) {
+      finalLeadStage = SUB_DISPOSITIONS_MAP[finalSubStatus].disposition;
+      finalLeadValidStatus = SUB_DISPOSITIONS_MAP[finalSubStatus].validStatus;
+    }
+
+    // Calculate Lead Score dynamically based on 6 clinical criteria
+    const computedLeadScore = calculateLeadScore({
+      husbandAge: finalHusbandAge,
+      wifeAge: finalWifeAge,
+      preMedicalConditions: finalPreMedical,
+      marriedSince: finalMarriedSince,
+      tryingToConceiveYears: finalTryingYears,
+      whenPlanningToStartTreatment: whenPlanningToStartTreatment || lookingForTreatment,
+    });
+    if ((finalSubStatus === "Visited Centre" || finalSubStatus === "Visited at Centre") && !centreVisitedDate) {
+      return res.status(400).json({
+        error: "Centre Visited Date is mandatory when Sub status is 'Visited Centre'.",
+      });
+    }
+    if ((finalSubStatus === "Visited Camp" || finalSubStatus === "Visited at Camp") && !campVisitedDate) {
+      return res.status(400).json({
+        error: "Camp Visited Date is mandatory when Sub status is 'Visited Camp'.",
+      });
+    }
+
+    // Follow Up Date and Time: empty if Stage is Converted/Closed
+    let finalFollowUp = (followUpDateTime || followUpDate || "").trim();
+    if (finalLeadStage === "Converted" || finalLeadStage === "Closed") {
+      finalFollowUp = "";
+    }
+
+    // Notes is mandatory
+    const submittedNotes = (notes || "").trim();
+    if (!submittedNotes) {
+      return res.status(400).json({ error: "Notes is mandatory." });
+    }
+
+    // Auto-generate IDs
+    if (!uniqueId || !uniqueId.trim()) {
+      uniqueId = await getNextUniqueId();
+    }
     const todayDate = getTodayDDMMMYY();
     const currentMonth = getCurrentMonthMMMYY();
     const currentTimestamp = getFormattedTimestamp(new Date());
+
+    if (!firstActivityDate) {
+      firstActivityDate = currentTimestamp;
+    }
+
+    // Lead Owner auto-assignment
+    let finalOwner = (leadOwner || callerName || "").trim();
+    if (session.role === "agent") {
+      finalOwner = (session.name || "").trim();
+    }
+    if (!finalOwner) {
+      finalOwner = session.name || "System Admin";
+    }
 
     const initialAudit = {
       performedBy: session.name || "System",
@@ -245,60 +409,126 @@ export async function createLead(req: Request, res: Response) {
       ],
     };
 
-    const initialNoteHistory = [];
-    const submittedNote = (notes || "").trim();
-    if (submittedNote) {
-      initialNoteHistory.push({
+    const initialNoteHistory = [
+      {
         performedBy: session.name || "User",
         performedByRole: session.role || "unknown",
         performedByEmail: session.email || "",
         timestamp: new Date().toISOString(),
         oldNotes: "",
-        newNotes: submittedNote,
-      });
-    }
+        newNotes: submittedNotes,
+      },
+    ];
 
-    const normalizedPhone = normalizePhoneNumber(finalMobile) || finalMobile;
-    const normalizedAlternate = alternateNumber ? normalizePhoneNumber(alternateNumber) || "" : "";
+    const normalizedPhone = normalizePhoneNumber(finalPrimaryMobile) || finalPrimaryMobile;
+    const normalizedAlternate = secondaryMobileNumber
+      ? normalizePhoneNumber(secondaryMobileNumber) || ""
+      : "";
 
     const newLead = await Lead.create({
+      // Primary Identifiers
       uniqueId,
-      date: (date || "").trim() || todayDate,
-      month: (month || "").trim() || currentMonth,
-      leadTimestamp: currentTimestamp,
-      mobileNumber: finalMobile,
-      phoneNumber: finalMobile,
-      alternateNumber: (alternateNumber || "").trim(),
+      firstActivityDate,
+
+      // Couple Profile
+      husbandName: finalHusband,
+      wifeName: finalWife,
+      husbandAge: finalHusbandAge,
+      wifeAge: finalWifeAge,
+
+      // Treatment & Clinical
+      whenPlanningToStartTreatment: (whenPlanningToStartTreatment || lookingForTreatment || "").trim(),
+      preMedicalConditions: finalPreMedical,
+      marriedSince: finalMarriedSince,
+      tryingToConceiveYears: finalTryingYears,
+
+      // Emails
+      primaryEmail: (primaryEmail || "").trim(),
+      secondaryEmail: (secondaryEmail || "").trim(),
+
+      // Mobile numbers
+      primaryMobileNumber: finalPrimaryMobile,
+      secondaryMobileNumber: (secondaryMobileNumber || "").trim(),
+      whatsappMobileNumber: (whatsappMobileNumber || "").trim(),
+      otherNumbers: (otherNumbers || "").trim(),
+
+      // Consents
+      whatsappConsent: (whatsappConsent || "No").trim(),
+      callingConsent: (callingConsent || "No").trim(),
+
+      // Source & Attribution
+      leadSource: (leadSource || utmSource || "General").trim(),
+      utmSource: (utmSource || leadSource || "").trim(),
+      campaignName: (campaignName || "General").trim(),
+      sourceName: (sourceName || "").trim(),
+      source: (source || "General").trim(),
+      leadScore: computedLeadScore || (leadScore || "0").trim(),
+
+      // Status & Dispositions
+      subStatus: finalSubStatus,
+      leadStage: finalLeadStage,
+      leadValidStatus: finalLeadValidStatus,
+
+      // Audit & Timestamps
+      createdByMember: session.name || "User",
+      createdOn: currentTimestamp,
+      modifiedByMember: session.name || "User",
+      modifiedOn: currentTimestamp,
+
+      // Address Details
+      centreAddress: (centreAddress || `${finalCentreLocation} Centre`).trim(),
+      ptAddress: (ptAddress || "").trim(),
+      ptPincode: (ptPincode || "").trim(),
+      ptCountry: (ptCountry || "India").trim(),
+      ptState: (ptState || "").trim(),
+      ptCity: (ptCity || "").trim(),
+
+      // Ownership & Dates
+      leadOwner: finalOwner,
+      leadAge: "0 days",
+      campLocation: finalCampLocation,
+      centreLocation: finalCentreLocation,
+      followUpDateTime: finalFollowUp,
+      centreVisitedDate: (centreVisitedDate || "").trim(),
+      campVisitedDate: (campVisitedDate || "").trim(),
+      appointmentDate: (appointmentDate || "").trim(),
+
+      // Registration & Plan
+      registrationStatus: (registrationStatus || "No").trim(),
+      registrationNumber: (registrationNumber || "").trim(),
+      registrationAmount: (registrationAmount || "").trim(),
+      package: (pkg || "").trim(),
+      plan: (plan || "").trim(),
+
+      // Notes
+      notes: submittedNotes,
+      notesHistory: initialNoteHistory,
+
+      // Indexed normalized phones
       normalizedPhone,
       normalizedAlternate,
-      callerName: (callerName || "").trim(),
-      patientName: finalPatient,
-      patientAge: (patientAge || "").trim(),
-      spouseName: (spouseName || "").trim(),
-      spouseAge: (spouseAge || "").trim(),
-      location: (location || otherCity || "").trim(),
-      otherCity: (otherCity || "").trim(),
-      lookingForTreatment: (lookingForTreatment || treatment || "").trim(),
-      treatmentRequirements: (treatmentRequirements || treatmentRequired || "").trim(),
-      preConditions: (preConditions || preCondition || "").trim(),
-      surgeryDetails: (surgeryDetails || surgicalData || "").trim(),
-      referredBy: (referredBy || "").trim(),
-      leadSource: (leadSource || "").trim(),
-      followUpDate: (followUpDate || followUpDates || "").trim(),
-      subDispositions: finalSubDisp,
-      dispositions: finalDisp,
-      validStatus: finalValidStatus,
-      appointmentDate: (appointmentDate || "").trim(),
-      appointmentMonth: (appointmentMonth || "").trim(),
-      teleconsultationSlot: (teleconsultationSlot || appointmentSlot || "").trim(),
-      consultationCharges: (consultationCharges || teleConsultationCharges || "").trim(),
-      notes: "", // Reset after saving to history as per business rule
-      notesHistory: initialNoteHistory,
-      surgeryPaymentReceived: (surgeryPaymentReceived || surgeryReceipt || "").trim(),
-      surgeryCost: (surgeryCost || "").trim(),
-      surgeryDate: (surgeryDate || "").trim(),
-      assignedDate: callerName ? todayDate : "",
-      assignedAt: callerName ? new Date().toISOString() : "",
+
+      // Backwards-compatible fields
+      patientName: finalWife,
+      patientAge: finalWifeAge,
+      spouseName: finalHusband,
+      spouseAge: finalHusbandAge,
+      mobileNumber: finalPrimaryMobile,
+      phoneNumber: finalPrimaryMobile,
+      alternateNumber: (secondaryMobileNumber || "").trim(),
+      callerName: finalOwner,
+      location: finalCentreLocation,
+      subDispositions: finalSubStatus,
+      dispositions: finalLeadStage,
+      validStatus: finalLeadValidStatus,
+      date: todayDate,
+      dateOfLead: todayDate,
+      month: currentMonth,
+      leadTimestamp: currentTimestamp,
+      followUpDate: finalFollowUp,
+      assignedDate: finalOwner ? todayDate : "",
+      assignedAt: finalOwner ? new Date().toISOString() : "",
+
       customFields: customFields || {},
       auditLogs: [initialAudit],
     });
@@ -318,50 +548,8 @@ export async function createLead(req: Request, res: Response) {
 }
 
 /**
- * GET /api/v1/leads/:id
- * Fetches a single lead by uniqueId or mongoId with agent ownership enforcement.
- */
-export async function getLeadById(req: Request, res: Response) {
-  try {
-    const session = req.user!;
-    const { id } = req.params;
-
-    let lead = null;
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      lead = await Lead.findById(id);
-    }
-    if (!lead) {
-      lead = await Lead.findOne({ uniqueId: id });
-    }
-
-    if (!lead) {
-      return res.status(404).json({ error: "Lead not found" });
-    }
-
-    // Agent permission check
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim().toLowerCase();
-      const leadCaller = (lead.callerName || "").trim().toLowerCase();
-      if (!leadCaller || leadCaller !== agentName) {
-        return res.status(403).json({
-          error: "Access denied. This lead is not assigned to you.",
-        });
-      }
-    }
-
-    return res.status(200).json({ lead });
-  } catch (error: any) {
-    console.error("Error fetching lead:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to fetch lead",
-    });
-  }
-}
-
-/**
  * PUT /api/v1/leads/:id
- * Updates lead fields with strict agent field protection, mandatory notes/sub-disposition,
- * audit logging, and notes history.
+ * Updates lead with comprehensive audit logging, status cascade, and validation.
  */
 export async function updateLead(req: Request, res: Response) {
   try {
@@ -369,9 +557,13 @@ export async function updateLead(req: Request, res: Response) {
     const { id } = req.params;
     const body = req.body;
 
-    let query: any = { uniqueId: id };
+    let query: any = {
+      $or: [
+        { uniqueId: id },
+        ],
+    };
     if (mongoose.Types.ObjectId.isValid(id)) {
-      query = { $or: [{ _id: id }, { uniqueId: id }] };
+      query.$or.push({ _id: id });
     }
 
     const existingLead = await Lead.findOne(query);
@@ -379,101 +571,123 @@ export async function updateLead(req: Request, res: Response) {
       return res.status(404).json({ error: "Lead not found" });
     }
 
-    // ── Agent Security & Validation ───────────────────────────────────────
+    // Role check for agents
     if (session.role === "agent") {
       const agentName = (session.name || "").trim().toLowerCase();
       const leadCaller = (existingLead.callerName || "").trim().toLowerCase();
-      if (!leadCaller || leadCaller !== agentName) {
+      const leadOwner = (existingLead.leadOwner || "").trim().toLowerCase();
+      if (leadCaller !== agentName && leadOwner !== agentName) {
         return res.status(403).json({
           error: "Access denied. You can only update leads assigned to you.",
         });
       }
-
-      // Preserve protected Section 1 values from existing lead
-      body.uniqueId = existingLead.uniqueId;
-      body.date = existingLead.date;
-      body.dateOfLead = existingLead.dateOfLead;
-      body.month = existingLead.month;
-      body.leadTimestamp = existingLead.leadTimestamp;
-      body.mobileNumber = existingLead.mobileNumber;
-      body.phoneNumber = existingLead.phoneNumber;
-      body.alternateNumber = existingLead.alternateNumber;
-      body.callerName = existingLead.callerName;
-      body.referredBy = existingLead.referredBy;
-      body.patientName = body.patientName !== undefined ? body.patientName : existingLead.patientName;
-      body.leadSource = body.leadSource !== undefined ? body.leadSource : existingLead.leadSource;
-
-      const newNotes = (body.notes || "").trim();
-      const newSubDisp = (body.subDispositions || "").trim();
-
-      // Mandatory check: Both must be provided
-      if (!newSubDisp) {
-        return res.status(400).json({
-          error: "Sub Dispositions is mandatory. Please select a Sub Disposition.",
-        });
-      }
-      if (!newNotes) {
-        return res.status(400).json({
-          error: "Notes & Observations is mandatory. Please enter call remarks.",
-        });
-      }
-
-      // Check if something changed
-      const latestNoteInHistory =
-        existingLead.notesHistory && existingLead.notesHistory.length > 0
-          ? (existingLead.notesHistory[0]?.newNotes || "").trim()
-          : "";
-      const oldNotes = (existingLead.notes || "").trim() || latestNoteInHistory;
-      const oldSubDisp = (existingLead.subDispositions || "").trim();
-      const hadExistingData = oldNotes !== "" || oldSubDisp !== "";
-
-      if (hadExistingData && oldNotes === newNotes && oldSubDisp === newSubDisp) {
-        return res.status(400).json({ error: "not update any thing" });
-      }
     }
 
-    // Normalize phone numbers if modified
-    if (body.mobileNumber) {
-      body.normalizedPhone = normalizePhoneNumber(body.mobileNumber) || body.mobileNumber;
-    }
-    if (body.alternateNumber) {
-      body.normalizedAlternate = normalizePhoneNumber(body.alternateNumber) || body.alternateNumber;
+    // Handle Sub Status cascading
+    if (body.subStatus && SUB_DISPOSITIONS_MAP[body.subStatus]) {
+      body.leadStage = SUB_DISPOSITIONS_MAP[body.subStatus].disposition;
+      body.leadValidStatus = SUB_DISPOSITIONS_MAP[body.subStatus].validStatus;
+      // Also update legacy
+      body.subDispositions = body.subStatus;
+      body.dispositions = body.leadStage;
+      body.validStatus = body.leadValidStatus;
+    } else if (body.subDispositions && SUB_DISPOSITIONS_MAP[body.subDispositions]) {
+      body.subStatus = body.subDispositions;
+      body.leadStage = SUB_DISPOSITIONS_MAP[body.subDispositions].disposition;
+      body.leadValidStatus = SUB_DISPOSITIONS_MAP[body.subDispositions].validStatus;
+      body.dispositions = body.leadStage;
+      body.validStatus = body.leadValidStatus;
     }
 
-    const submittedNotes = (body.notes || "").trim();
+    // Camp to Centre Location cascade
+    if (body.campLocation && CAMP_TO_CENTRE_MAP[body.campLocation] && !body.centreLocation) {
+      body.centreLocation = CAMP_TO_CENTRE_MAP[body.campLocation];
+      body.location = body.centreLocation;
+    }
 
-    // ── Audit Diff Tracking ──────────────────────────────────────────────
+    // Recompute Lead Score if any of the 6 clinical/demographic criteria are modified
+    const hAge = body.husbandAge !== undefined ? body.husbandAge : existingLead.husbandAge;
+    const wAge = body.wifeAge !== undefined ? body.wifeAge : existingLead.wifeAge;
+    const med = body.preMedicalConditions !== undefined ? body.preMedicalConditions : existingLead.preMedicalConditions;
+    const ms = body.marriedSince !== undefined ? body.marriedSince : existingLead.marriedSince;
+    const ttc = body.tryingToConceiveYears !== undefined ? body.tryingToConceiveYears : existingLead.tryingToConceiveYears;
+    const when = body.whenPlanningToStartTreatment !== undefined ? body.whenPlanningToStartTreatment : existingLead.whenPlanningToStartTreatment;
+
+    body.leadScore = calculateLeadScore({
+      husbandAge: hAge,
+      wifeAge: wAge,
+      preMedicalConditions: med,
+      marriedSince: ms,
+      tryingToConceiveYears: ttc,
+      whenPlanningToStartTreatment: when,
+    });
+
+    // Empty followUpDateTime if Converted or Closed
+    const effectiveStage = body.leadStage || existingLead.leadStage;
+    if (effectiveStage === "Converted" || effectiveStage === "Closed") {
+      body.followUpDateTime = "";
+      body.followUpDate = "";
+    }
+
+    // Normalizations
+    if (body.primaryMobileNumber || body.mobileNumber) {
+      const p = body.primaryMobileNumber || body.mobileNumber;
+      body.primaryMobileNumber = p;
+      body.mobileNumber = p;
+      body.normalizedPhone = normalizePhoneNumber(p) || p;
+    }
+    if (body.secondaryMobileNumber || body.alternateNumber) {
+      const a = body.secondaryMobileNumber || body.alternateNumber;
+      body.secondaryMobileNumber = a;
+      body.alternateNumber = a;
+      body.normalizedAlternate = normalizePhoneNumber(a) || a;
+    }
+
+    // Sync legacy/new couple names
+    if (body.wifeName && !body.patientName) body.patientName = body.wifeName;
+    if (body.husbandName && !body.spouseName) body.spouseName = body.husbandName;
+    if (body.wifeAge && !body.patientAge) body.patientAge = body.wifeAge;
+    if (body.husbandAge && !body.spouseAge) body.spouseAge = body.husbandAge;
+
+    const currentTimestamp = getFormattedTimestamp(new Date());
+    body.modifiedByMember = session.name || "User";
+    body.modifiedOn = currentTimestamp;
+
+    // Track Audit Log
     const FIELD_LABELS: Record<string, string> = {
-      patientName: "Patient Name",
-      patientAge: "Patient Age",
-      spouseName: "Spouse Name",
-      spouseAge: "Spouse Age",
-      location: "Location",
-      otherCity: "Other City",
-      lookingForTreatment: "Looking for Treatment",
-      treatmentRequirements: "Treatment Requirements",
-      preConditions: "Pre Conditions",
-      surgeryDetails: "Surgery Details",
-      referredBy: "Referred By",
-      leadSource: "Lead Source",
-      callerName: "Caller Name",
-      date: "Lead Date",
-      dateOfLead: "Lead Date",
-      month: "Lead Month",
-      mobileNumber: "Mobile Number",
-      phoneNumber: "Mobile Number",
-      alternateNumber: "Alternate #",
-      followUpDate: "Follow Up Date",
-      subDispositions: "Sub Dispositions",
-      dispositions: "Dispositions",
-      validStatus: "Valid Status",
+      husbandName: "Husband Name",
+      wifeName: "Wife Name",
+      husbandAge: "Husband Age",
+      wifeAge: "Wife Age",
+      whenPlanningToStartTreatment: "Planning Treatment",
+      preMedicalConditions: "Pre Medical Conditions",
+      marriedSince: "Married Since",
+      tryingToConceiveYears: "Trying to Conceive",
+      primaryEmail: "Primary Email",
+      secondaryEmail: "Secondary Email",
+      primaryMobileNumber: "Primary Mobile",
+      secondaryMobileNumber: "Secondary Mobile",
+      whatsappMobileNumber: "Whatsapp Mobile",
+      subStatus: "Sub Status",
+      leadStage: "Lead Stage",
+      leadValidStatus: "Lead Valid Status",
+      centreLocation: "Centre Location",
+      campLocation: "Camp Location",
+      centreAddress: "Centre Address",
+      ptAddress: "Pt Address",
+      ptPincode: "Pt Pincode",
+      ptCity: "Pt City",
+      ptState: "Pt State",
+      leadOwner: "Lead Owner",
+      followUpDateTime: "Follow Up Date & Time",
       appointmentDate: "Appointment Date",
-      appointmentMonth: "Appointment Month",
-      teleconsultationSlot: "Teleconsultation Slot",
-      consultationCharges: "Consultation Charges",
-      surgeryDate: "Surgery Date",
-      surgeryCost: "Surgery Cost",
-      surgeryPaymentReceived: "Surgery Payment Received",
+      centreVisitedDate: "Centre Visited Date",
+      campVisitedDate: "Camp Visited Date",
+      registrationStatus: "Registration Status",
+      registrationNumber: "Registration Number",
+      registrationAmount: "Registration Amount",
+      package: "Package",
+      plan: "Plan",
     };
 
     const changes: Array<{
@@ -483,24 +697,7 @@ export async function updateLead(req: Request, res: Response) {
       newValue: string;
     }> = [];
 
-    const ignoredFields = new Set([
-      "_id",
-      "__v",
-      "createdAt",
-      "updatedAt",
-      "auditLogs",
-      "notesHistory",
-      "createdBy",
-      "treatment",
-      "notes",
-      "phoneNumber",
-      "dateOfLead",
-      "normalizedPhone",
-      "normalizedAlternate",
-    ]);
-
     for (const [key, label] of Object.entries(FIELD_LABELS)) {
-      if (ignoredFields.has(key)) continue;
       if (body[key] !== undefined) {
         const oldVal = (existingLead.get(key) ?? "").toString().trim();
         const newVal = (body[key] ?? "").toString().trim();
@@ -515,74 +712,56 @@ export async function updateLead(req: Request, res: Response) {
       }
     }
 
-    // Build surgical atomic update operations
-    const setUpdates: Record<string, any> = {};
+    const setUpdates: Record<string, any> = { ...body };
+    delete setUpdates._id;
+    delete setUpdates.auditLogs;
+    delete setUpdates.notesHistory;
+
     const pushUpdates: Record<string, any> = {};
 
-    // Copy modified scalar fields to $set, excluding subdocument history arrays
-    for (const [key, val] of Object.entries(body)) {
-      if (key !== "auditLogs" && key !== "notesHistory" && key !== "_id") {
-        setUpdates[key] = val;
-      }
-    }
-
-    // Atomic push for note history entry if a new note was submitted
-    if (submittedNotes) {
-      const currentNotesHistory = existingLead.notesHistory || [];
-      const previousNote =
-        (existingLead.notes || "").trim() ||
-        (currentNotesHistory.length > 0 ? (currentNotesHistory[0]?.newNotes || "").trim() : "");
-
-      const newNoteEntry = {
-        performedBy: session.name || "Unknown Member",
-        performedByRole: session.role || "unknown",
-        performedByEmail: session.email || "",
-        timestamp: new Date().toISOString(),
-        oldNotes: previousNote,
-        newNotes: submittedNotes,
-      };
-
-      pushUpdates.notesHistory = {
-        $each: [newNoteEntry],
-        $position: 0,
-      };
-    }
-    setUpdates.notes = ""; // Reset notes field
-
-    // Atomic push for new audit log entry if changes occurred
     if (changes.length > 0) {
-      const newAuditLog = {
-        performedBy: session.name || "Unknown Member",
-        performedByRole: session.role || "unknown",
-        performedByEmail: session.email || "",
-        timestamp: new Date().toISOString(),
-        changes,
-      };
       pushUpdates.auditLogs = {
-        $each: [newAuditLog],
+        $each: [
+          {
+            performedBy: session.name || "User",
+            performedByRole: session.role || "unknown",
+            performedByEmail: session.email || "",
+            timestamp: new Date().toISOString(),
+            changes,
+          },
+        ],
         $position: 0,
       };
     }
 
-    // Stamp assignment date when callerName changes (for non-agents)
-    if (session.role !== "agent") {
-      const oldCaller = (existingLead.callerName || "").trim().toLowerCase();
-      const newCaller = (body.callerName || "").trim().toLowerCase();
-      if (newCaller && newCaller !== oldCaller) {
-        setUpdates.assignedDate = getTodayDDMMMYY();
-        setUpdates.assignedAt = new Date().toISOString();
-      }
+    // Notes history
+    const submittedNotes = (body.notes || "").trim();
+    if (submittedNotes) {
+      pushUpdates.notesHistory = {
+        $each: [
+          {
+            performedBy: session.name || "User",
+            performedByRole: session.role || "unknown",
+            performedByEmail: session.email || "",
+            timestamp: new Date().toISOString(),
+            oldNotes: existingLead.notes || "",
+            newNotes: submittedNotes,
+          },
+        ],
+        $position: 0,
+      };
+      setUpdates.notes = submittedNotes;
     }
 
-    const updateOps: any = {};
-    if (Object.keys(setUpdates).length > 0) updateOps.$set = setUpdates;
-    if (Object.keys(pushUpdates).length > 0) updateOps.$push = pushUpdates;
+    const updateOps: any = { $set: setUpdates };
+    if (Object.keys(pushUpdates).length > 0) {
+      updateOps.$push = pushUpdates;
+    }
 
-    const updatedLead = await Lead.findOneAndUpdate(
-      query,
-      updateOps,
-      { new: true, runValidators: true }
-    );
+    const updatedLead = await Lead.findByIdAndUpdate(existingLead._id, updateOps, {
+      new: true,
+      runValidators: false,
+    });
 
     invalidateDashboardCache();
 
@@ -600,23 +779,22 @@ export async function updateLead(req: Request, res: Response) {
 
 /**
  * DELETE /api/v1/leads/:id
- * Deletes a lead. Agents are strictly forbidden from deleting leads.
  */
 export async function deleteLead(req: Request, res: Response) {
   try {
     const session = req.user!;
-
-    if (session.role === "agent") {
-      return res.status(403).json({
-        error: "Forbidden. Agents are not permitted to delete leads.",
-      });
+    if (session.role !== "admin") {
+      return res.status(403).json({ error: "Only admins can delete leads" });
     }
 
     const { id } = req.params;
-
-    let query: any = { uniqueId: id };
+    let query: any = {
+      $or: [
+        { uniqueId: id },
+        ],
+    };
     if (mongoose.Types.ObjectId.isValid(id)) {
-      query = { $or: [{ _id: id }, { uniqueId: id }] };
+      query.$or.push({ _id: id });
     }
 
     const deleted = await Lead.findOneAndDelete(query);
@@ -637,71 +815,45 @@ export async function deleteLead(req: Request, res: Response) {
 
 /**
  * GET /api/v1/leads/check-phone
- * Fast duplicate-phone check returning minimal identification fields.
+ * Real-time duplication checker for phone numbers.
  */
 export async function checkPhone(req: Request, res: Response) {
   try {
-    const session = req.user!;
-    const rawInput = (req.query.phone as string) || "";
-    const cleanDigits = rawInput.trim().replace(/\D/g, "");
-
-    // If less than 4 digits, return empty array immediately without querying database
-    if (cleanDigits.length < 4) {
+    const raw = req.query.phone as string | undefined;
+    if (!raw || !raw.trim()) {
       return res.status(200).json({ duplicates: [] });
     }
 
-    const normalized = normalizePhoneNumber(rawInput);
+    const clean = raw.trim();
+    const normalized = normalizePhoneNumber(clean) || clean;
 
-    let orConditions: any[] = [];
-    if (normalized) {
-      // 1. High-Performance Indexed Exact Match on normalized fields
-      orConditions.push(
+    const duplicates = await Lead.find({
+      $or: [
+        { primaryMobileNumber: clean },
+        { secondaryMobileNumber: clean },
         { normalizedPhone: normalized },
         { normalizedAlternate: normalized },
-        // Exact match on raw fields as well
-        { mobileNumber: normalized },
-        { alternateNumber: normalized },
-        { phoneNumber: normalized }
-      );
-    } else {
-      // Fallback for partial/short phone queries (e.g. 4-6 digits)
-      const phoneRegex = new RegExp(cleanDigits, "i");
-      orConditions.push(
-        { mobileNumber: { $regex: phoneRegex } },
-        { alternateNumber: { $regex: phoneRegex } },
-        { phoneNumber: { $regex: phoneRegex } }
-      );
-    }
-
-    const query: any = { $or: orConditions };
-
-    // If agent, restrict to agent's assigned leads
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim();
-      query.callerName = {
-        $regex: new RegExp(`^${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-      };
-    }
-
-    const duplicates = await Lead.find(query)
+        { mobileNumber: clean },
+        { phoneNumber: clean },
+      ],
+    })
       .select({
         uniqueId: 1,
+        wifeName: 1,
+        husbandName: 1,
         patientName: 1,
+        primaryMobileNumber: 1,
+        secondaryMobileNumber: 1,
         mobileNumber: 1,
-        alternateNumber: 1,
-        phoneNumber: 1,
+        centreLocation: 1,
         location: 1,
-        callerName: 1,
-        dispositions: 1,
       })
-      .limit(10)
+      .limit(5)
       .lean();
 
     return res.status(200).json({ duplicates });
   } catch (error: any) {
     console.error("Error checking phone duplicate:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to check phone number",
-    });
+    return res.status(500).json({ error: "Failed to check phone duplicates" });
   }
 }

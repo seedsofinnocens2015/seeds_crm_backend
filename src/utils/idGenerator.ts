@@ -5,42 +5,43 @@ const COUNTER_ID = "lead_unique_id";
 
 /**
  * Initializes the atomic counter if it does not already exist.
- * Scans the highest current valid SC-<number> to ensure no duplicate IDs are generated.
+ * Scans the highest current valid SOI-<number> or SC-<number> to ensure no duplicate IDs are generated.
  */
 async function initializeCounterIfNeeded(): Promise<number> {
   const existingCounter = await Counter.findById(COUNTER_ID);
-  if (existingCounter) {
+  if (existingCounter && existingCounter.seq > 0) {
     return existingCounter.seq;
   }
 
-  // Scan recent highest leads to determine highest existing SC number
+  // Find all leads with any uniqueId to find the maximum sequential integer ID
   const recentLeads = await Lead.find(
-    { uniqueId: { $regex: /^SC-\d+$/i } },
+    {},
     { uniqueId: 1 }
   )
     .sort({ createdAt: -1 })
-    .limit(100)
+    .limit(500)
     .lean();
 
   let maxNum = 0;
   for (const l of recentLeads) {
     if (l.uniqueId) {
-      const match = l.uniqueId.match(/^SC-(\d+)$/i);
+      // Matches SOI-1, SC-1, etc. (pure sequential integers)
+      // Excludes year formats like SOI-2026-0001
+      const match = l.uniqueId.match(/^(?:SOI|SC)-(\d+)$/i);
       if (match) {
         const num = parseInt(match[1], 10);
-        if (num > maxNum) maxNum = num;
+        // If it was an old 2026xxxx year-based number (> 20000000), ignore it
+        if (num < 20000000 && num > maxNum) {
+          maxNum = num;
+        }
       }
     }
   }
 
-  if (maxNum === 0) {
-    maxNum = await Lead.countDocuments();
-  }
-
-  // Atomically upsert counter if not exists
+  // Atomically upsert counter
   const initialized = await Counter.findByIdAndUpdate(
     COUNTER_ID,
-    { $setOnInsert: { seq: maxNum } },
+    { $set: { seq: maxNum } },
     { upsert: true, new: true }
   );
 
@@ -48,8 +49,7 @@ async function initializeCounterIfNeeded(): Promise<number> {
 }
 
 /**
- * Generates the next sequential unique ID in the format SC-<number> atomically.
- * Uses MongoDB findOneAndUpdate with $inc so concurrent workers never get the same ID.
+ * Generates the next sequential unique ID in the format SOI-<number> atomically.
  */
 export async function getNextUniqueId(): Promise<string> {
   await initializeCounterIfNeeded();
@@ -60,5 +60,5 @@ export async function getNextUniqueId(): Promise<string> {
     { new: true, upsert: true }
   );
 
-  return `SC-${counter.seq}`;
+  return `SOI-${counter.seq}`;
 }
