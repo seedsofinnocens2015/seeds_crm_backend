@@ -2,6 +2,7 @@ import http from "http";
 import app from "./app.js";
 import { config } from "./config/env.js";
 import { connectDB, disconnectDB } from "./config/db.js";
+import { startSmartfloScheduler, stopSmartfloScheduler } from "./services/smartflo/smartfloScheduler.js";
 
 const server = http.createServer(app);
 
@@ -16,6 +17,9 @@ async function startServer() {
   server.listen(config.port, () => {
     console.log(`[Server] seeds-crm-backend running on port ${config.port} in ${config.nodeEnv} mode`);
     console.log(`[Server] Health check available at: http://localhost:${config.port}/health`);
+
+    // Register Smartflo queue and CDR scheduler if feature flag is active
+    startSmartfloScheduler();
   });
 }
 
@@ -26,6 +30,7 @@ async function shutdown(signal: string) {
   server.close(async () => {
     console.log("[Server] HTTP server closed.");
     try {
+      stopSmartfloScheduler();
       await disconnectDB();
       console.log("[Server] Cleanup complete. Exiting process.");
       process.exit(0);

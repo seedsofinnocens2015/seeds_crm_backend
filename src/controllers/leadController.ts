@@ -16,6 +16,7 @@ import {
   getNextUniqueId,
   } from "../utils/idGenerator.js";
 import { invalidateDashboardCache } from "../utils/cacheInvalidation.js";
+import { enqueueLeadForSmartflo } from "../services/smartflo/smartfloSyncService.js";
 
 // Projection for table view: excludes heavy auditLogs and notesHistory
 const TABLE_VIEW_PROJECTION = {
@@ -534,6 +535,11 @@ export async function createLead(req: Request, res: Response) {
     });
 
     invalidateDashboardCache();
+
+    // Asynchronously enqueue lead for Smartflo synchronization (non-blocking)
+    enqueueLeadForSmartflo(newLead._id, newLead.uniqueId).catch((err) => {
+      console.error("[Smartflo Lead Hook] Background enqueue error:", err.message);
+    });
 
     return res.status(201).json({
       message: "Lead created successfully",

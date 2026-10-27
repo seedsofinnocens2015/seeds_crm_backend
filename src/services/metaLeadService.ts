@@ -6,6 +6,7 @@ import { MetaAdsSetupConfig } from "../models/MetaAdsSetupConfig.js";
 import { MetaPageService } from "./metaPageService.js";
 import { getNextUniqueId } from "../utils/idGenerator.js";
 import { normalizePhoneNumber } from "../utils/phoneUtils.js";
+import { enqueueLeadForSmartflo } from "./smartflo/smartfloSyncService.js";
 
 export interface MetaFieldData {
   name: string;
@@ -478,6 +479,11 @@ export async function ingestMetaLead(
 
   const newLead = new Lead(mappedFields);
   await newLead.save();
+
+  // Asynchronously enqueue lead for Smartflo synchronization (non-blocking)
+  enqueueLeadForSmartflo(newLead._id, nextUniqueId).catch((err) => {
+    console.error("[Smartflo Meta Hook] Background enqueue error:", err.message);
+  });
 
   // Update Page connection's lastLeadReceivedAt timestamp
   if (details.page_id) {

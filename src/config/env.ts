@@ -15,6 +15,12 @@ export interface AppConfig {
   metaOAuthRedirectUri: string;
   metaPageAccessToken: string;
   metaGraphApiVersion: string;
+  smartfloApiBaseUrl: string;
+  smartfloApiToken: string;
+  smartfloLeadListId: string;
+  smartfloSyncEnabled: boolean;
+  smartfloWebhookSecret: string;
+  smartfloApiKey: string; // Key for Smartflo custom connector to query CRM read endpoints
 }
 
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -39,4 +45,11 @@ export const config: AppConfig = {
     process.env.META_OAUTH_REDIRECT_URI || "http://localhost:3000/admin/integrations/meta/callback",
   metaPageAccessToken: process.env.META_PAGE_ACCESS_TOKEN || "",
   metaGraphApiVersion: process.env.META_GRAPH_API_VERSION || "v21.0",
+  smartfloApiBaseUrl:
+    process.env.SMARTFLO_API_BASE_URL || "https://api-smartflo.tatateleservices.com/v1",
+  smartfloApiToken: process.env.SMARTFLO_API_TOKEN || "",
+  smartfloLeadListId: process.env.SMARTFLO_LEAD_LIST_ID || "",
+  smartfloSyncEnabled: process.env.SMARTFLO_SYNC_ENABLED === "true",
+  smartfloWebhookSecret: process.env.SMARTFLO_WEBHOOK_SECRET || "",
+  smartfloApiKey: process.env.SMARTFLO_API_KEY || "",
 };

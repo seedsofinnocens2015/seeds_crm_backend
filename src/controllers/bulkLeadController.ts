@@ -11,6 +11,7 @@ import {
 import { normalizePhoneNumber } from "../utils/phoneUtils.js";
 import { getNextUniqueId } from "../utils/idGenerator.js";
 import { invalidateDashboardCache } from "../utils/cacheInvalidation.js";
+import { enqueueBulkLeadsForSmartflo } from "../services/smartflo/smartfloSyncService.js";
 
 const MONTH_NAMES_S = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -295,6 +296,15 @@ export async function bulkUploadLeads(req: Request, res: Response) {
     const nextId = await getNextUniqueId();
 
     invalidateDashboardCache();
+
+    // Asynchronously bulk enqueue imported leads for Smartflo synchronization (non-blocking)
+    if (insertedLeads.length > 0) {
+      enqueueBulkLeadsForSmartflo(
+        insertedLeads.map((l: any) => ({ _id: l._id, uniqueId: l.uniqueId }))
+      ).catch((err) => {
+        console.error("[Smartflo Bulk Hook] Background bulk enqueue error:", err.message);
+      });
+    }
 
     return res.status(200).json({
       success: true,

@@ -7,8 +7,15 @@ import { MetaPageController } from "../controllers/metaPageController.js";
 import { verifyMetaSignature } from "../middleware/metaSignature.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/roleGuard.js";
+import smartfloRoutes from "./smartfloRoutes.js";
 
 const router = Router();
+
+/**
+ * Smartflo Integration Endpoints
+ * /api/v1/integrations/smartflo/*
+ */
+router.use("/smartflo", smartfloRoutes);
 
 /**
  * Public Webhook Endpoints (secured via Meta token and HMAC SHA-256 signatures)
