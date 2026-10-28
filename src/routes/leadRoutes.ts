@@ -6,6 +6,7 @@ import {
   updateLead,
   deleteLead,
   checkPhone,
+  resetLeadCounter,
 } from "../controllers/leadController.js";
 import {
   bulkUploadLeads,
@@ -22,6 +23,7 @@ router.use(requireAuth);
 
 // Static / specialized routes (must precede /:id)
 router.get("/check-phone", checkPhone);
+router.post("/reset-counter", resetLeadCounter);
 
 // Bulk operations
 router.post("/bulk-upload", bulkUploadLeads);

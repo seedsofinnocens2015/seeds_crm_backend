@@ -14,7 +14,9 @@ import {
 import { normalizePhoneNumber } from "../utils/phoneUtils.js";
 import {
   getNextUniqueId,
-  } from "../utils/idGenerator.js";
+  peekNextUniqueId,
+  resetCounterToActualMax,
+} from "../utils/idGenerator.js";
 import { invalidateDashboardCache } from "../utils/cacheInvalidation.js";
 import { enqueueLeadForSmartflo } from "../services/smartflo/smartfloSyncService.js";
 
@@ -123,7 +125,7 @@ export async function getLeads(req: Request, res: Response) {
             .limit(limit)
             .lean(),
       Lead.countDocuments(query),
-      getNextUniqueId(),
+      peekNextUniqueId(),
     ]);
 
     // Dynamic real-time calculation of leadAge for each lead
@@ -375,9 +377,7 @@ export async function createLead(req: Request, res: Response) {
     }
 
     // Auto-generate IDs
-    if (!uniqueId || !uniqueId.trim()) {
-      uniqueId = await getNextUniqueId();
-    }
+    uniqueId = await getNextUniqueId();
     const todayDate = getTodayDDMMMYY();
     const currentMonth = getCurrentMonthMMMYY();
     const currentTimestamp = getFormattedTimestamp(new Date());
@@ -386,13 +386,10 @@ export async function createLead(req: Request, res: Response) {
       firstActivityDate = currentTimestamp;
     }
 
-    // Lead Owner auto-assignment
+    // Lead Owner (Optional): if not provided by admin/user, can remain empty / unassigned
     let finalOwner = (leadOwner || callerName || "").trim();
-    if (session.role === "agent") {
+    if (session.role === "agent" && !finalOwner) {
       finalOwner = (session.name || "").trim();
-    }
-    if (!finalOwner) {
-      finalOwner = session.name || "System Admin";
     }
 
     const initialAudit = {
@@ -861,5 +858,24 @@ export async function checkPhone(req: Request, res: Response) {
   } catch (error: any) {
     console.error("Error checking phone duplicate:", error);
     return res.status(500).json({ error: "Failed to check phone duplicates" });
+  }
+}
+
+
+/**
+ * POST /api/v1/leads/reset-counter
+ * Resets counter to match actual existing leads in the database
+ */
+export async function resetLeadCounter(req: Request, res: Response) {
+  try {
+    const maxNum = await resetCounterToActualMax();
+    const nextUniqueId = await peekNextUniqueId();
+    return res.status(200).json({
+      message: 'Counter synchronized successfully',
+      currentMaxSeq: maxNum,
+      nextUniqueId,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Failed to reset counter' });
   }
 }

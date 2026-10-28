@@ -102,10 +102,10 @@ export const DEFAULT_FORM_FIELDS: IFormField[] = [
     type: "text",
     section: 1,
     order: 7,
-    required: true,
+    required: false,
     isSystem: true,
-    readOnly: true,
-    placeholder: "Owner of the lead",
+    readOnly: false,
+    placeholder: "Owner of the lead (Optional)",
     enabled: true,
   },
   {

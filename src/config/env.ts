@@ -16,7 +16,11 @@ export interface AppConfig {
   metaPageAccessToken: string;
   metaGraphApiVersion: string;
   smartfloApiBaseUrl: string;
-  smartfloApiToken: string;
+  smartfloLoginId: string;
+  smartfloPassword: string;
+  smartfloSyncType: "contact" | "broadcast";
+  smartfloContactGroupId: string;
+  smartfloBroadcastListId: string;
   smartfloLeadListId: string;
   smartfloSyncEnabled: boolean;
   smartfloWebhookSecret: string;
@@ -30,26 +34,39 @@ function getEnvNumber(key: string, defaultValue: number): number {
   return isNaN(parsed) ? defaultValue : parsed;
 }
 
+function getSyncType(val: string | undefined): "contact" | "broadcast" {
+  const clean = (val || "").trim().toLowerCase();
+  return clean === "broadcast" ? "broadcast" : "contact";
+}
+
 export const config: AppConfig = {
   port: getEnvNumber("PORT", 5000),
   nodeEnv: (process.env.NODE_ENV as "development" | "production" | "test") || "development",
-  mongodbUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/seeds_crm_dev",
-  jwtSecret: process.env.JWT_SECRET || "seeds_crm_dev_fallback_secret",
-  corsOrigin: (process.env.CORS_ORIGIN || "http://localhost:3000")
+  mongodbUri: process.env.MONGODB_URI || "0",
+  jwtSecret: process.env.JWT_SECRET || "0",
+  corsOrigin: (process.env.CORS_ORIGIN || "0")
     .split(",")
     .map((origin) => origin.trim()),
   metaAppId: process.env.META_APP_ID || "",
   metaAppSecret: process.env.META_APP_SECRET || "",
   metaWebhookVerifyToken: process.env.META_WEBHOOK_VERIFY_TOKEN || "",
   metaOAuthRedirectUri:
-    process.env.META_OAUTH_REDIRECT_URI || "http://localhost:3000/admin/integrations/meta/callback",
+    process.env.META_OAUTH_REDIRECT_URI || "0",
   metaPageAccessToken: process.env.META_PAGE_ACCESS_TOKEN || "",
   metaGraphApiVersion: process.env.META_GRAPH_API_VERSION || "v21.0",
   smartfloApiBaseUrl:
-    process.env.SMARTFLO_API_BASE_URL || "https://api-smartflo.tatateleservices.com/v1",
-  smartfloApiToken: process.env.SMARTFLO_API_TOKEN || "",
-  smartfloLeadListId: process.env.SMARTFLO_LEAD_LIST_ID || "",
-  smartfloSyncEnabled: process.env.SMARTFLO_SYNC_ENABLED === "true",
+    process.env.SMARTFLO_API_BASE_URL || "0",
+  smartfloLoginId: process.env.SMARTFLO_LOGIN_ID || "",
+  smartfloPassword: process.env.SMARTFLO_PASSWORD || "",
+  smartfloSyncType: getSyncType(process.env.SMARTFLO_SYNC_TYPE),
+  smartfloContactGroupId: process.env.SMARTFLO_CONTACT_GROUP_ID || "",
+  smartfloBroadcastListId: process.env.SMARTFLO_BROADCAST_LIST_ID || process.env.SMARTFLO_LEAD_LIST_ID || "",
+  smartfloLeadListId:
+    process.env.SMARTFLO_BROADCAST_LIST_ID ||
+    process.env.SMARTFLO_LEAD_LIST_ID ||
+    process.env.SMARTFLO_CONTACT_GROUP_ID ||
+    "",
+  smartfloSyncEnabled: process.env.SMARTFLO_SYNC_ENABLED === "0",
   smartfloWebhookSecret: process.env.SMARTFLO_WEBHOOK_SECRET || "",
   smartfloApiKey: process.env.SMARTFLO_API_KEY || "",
 };

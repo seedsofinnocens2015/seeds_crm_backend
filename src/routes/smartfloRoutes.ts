@@ -6,6 +6,7 @@ import {
   streamCallRecording,
   getSmartfloSyncJobs,
   retrySmartfloSyncJob,
+  testSyncSingleSmartfloJob,
   triggerCdrReconciliation,
 } from "../controllers/smartfloController.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -44,6 +45,9 @@ router.get("/jobs", requireAuth, requireRole(privilegedRoles), getSmartfloSyncJo
 
 // Retry failed sync job
 router.post("/jobs/:jobId/retry", requireAuth, requireRole(privilegedRoles), retrySmartfloSyncJob);
+
+// Admin-only test execution endpoint for an explicitly selected single job (safe bypass for approved dummy testing)
+router.post("/jobs/:jobId/test-sync", requireAuth, requireRole(["admin"]), testSyncSingleSmartfloJob);
 
 // Manual CDR reconciliation
 router.post("/cdr-sync", requireAuth, requireRole(privilegedRoles), triggerCdrReconciliation);

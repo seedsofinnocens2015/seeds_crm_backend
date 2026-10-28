@@ -13,10 +13,23 @@ function formatDateTimeYMDHMS(d: Date): string {
 }
 
 /**
+ * Helper to determine if Smartflo sync is configured for the active sync type.
+ */
+function isSmartfloSyncConfigured(): boolean {
+  if (!config.smartfloSyncEnabled || !config.smartfloLoginId || !config.smartfloPassword) {
+    return false;
+  }
+  if (config.smartfloSyncType === "broadcast") {
+    return Boolean(config.smartfloBroadcastListId || config.smartfloLeadListId);
+  }
+  return Boolean(config.smartfloContactGroupId || config.smartfloLeadListId);
+}
+
+/**
  * Executes a single locked cycle of the pending Smartflo jobs queue.
  */
 export async function executeQueueCycle(limit: number = 50): Promise<number> {
-  if (!config.smartfloSyncEnabled || !config.smartfloApiToken) {
+  if (!isSmartfloSyncConfigured()) {
     return 0;
   }
   if (isQueueRunning) {
@@ -38,7 +51,13 @@ export async function executeQueueCycle(limit: number = 50): Promise<number> {
  * Executes a single locked cycle of CDR reconciliation for the trailing 2-hour window.
  */
 export async function executeCdrReconciliationCycle(): Promise<void> {
-  if (!config.smartfloSyncEnabled || !config.smartfloApiToken) {
+  const isConfigured = Boolean(
+    config.smartfloSyncEnabled &&
+    config.smartfloLoginId &&
+    config.smartfloPassword
+  );
+
+  if (!isConfigured) {
     return;
   }
   if (isCdrRunning) {

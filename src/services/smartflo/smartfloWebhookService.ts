@@ -4,29 +4,57 @@ import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
 
 export interface SmartfloWebhookPayload {
-  call_id?: string;
-  callId?: string;
+  // Call ID aliases
+  CallSessionId?: string | number;
+  call_id?: string | number;
+  callId?: string | number;
+
+  // Phone number aliases
+  SourceNumber?: string | number;
+  caller_id_number?: string | number;
+  DestinationNumber?: string | number;
+  call_to_number?: string | number;
+  DisplayNumber?: string | number;
+  customer_number?: string | number;
+
+  // UUID & Reference ID
   uuid?: string;
   ref_id?: string;
   refId?: string;
-  caller_id_number?: string;
-  customer_number?: string;
-  call_to_number?: string;
+
+  // Status & Direction
+  Status?: string;
   call_status?: string;
   status?: string;
+  Direction?: string;
   direction?: string;
+
+  // Durations
+  CallDuration?: number | string;
   duration?: number | string;
   billsec?: number | string;
   answered_duration?: number | string;
+
+  // Timestamps
+  StartTime?: string;
   start_stamp?: string;
-  end_stamp?: string;
   calldate?: string;
+  EndTime?: string;
+  end_stamp?: string;
+
+  // Agent aliases
   answered_agent?: string;
   agent_name?: string;
   agent_id?: string;
   answered_agent_number?: string;
+
+  // Recording URL aliases
+  RecordingUrl?: string;
+  RecordingURL?: string;
   recording_url?: string;
   recordingUrl?: string;
+
+  // Custom Lead Tracking parameters
   custom_parameter_1?: string; // May carry CRM Unique ID e.g. "SOI-101"
   custom_parameter_2?: string;
   custom_parameter_3?: string;
@@ -63,13 +91,48 @@ function normalizeCallStatus(raw: string): "answered" | "missed" | "busy" | "fai
 
 /**
  * Normalizes call direction.
+ * Returns "unknown" if direction is missing or unrecognized.
  */
 function normalizeCallDirection(raw: string): "inbound" | "outbound" | "broadcast" | "unknown" {
   const d = (raw || "").toLowerCase().trim();
+  if (!d) return "unknown";
   if (d.includes("in")) return "inbound";
   if (d.includes("broad")) return "broadcast";
   if (d.includes("out")) return "outbound";
-  return "outbound";
+  return "unknown";
+}
+
+/**
+ * Safely parses integer duration; never returns NaN.
+ */
+function parseSafeDuration(val: any): number {
+  if (val === undefined || val === null || val === "") return 0;
+  const parsed = parseInt(String(val).trim(), 10);
+  return isNaN(parsed) || parsed < 0 ? 0 : parsed;
+}
+
+/**
+ * Safely parses dates including ISO8601 and SQL format "YYYY-MM-DD HH:mm:ss".
+ * Returns undefined if input is empty, null, or invalid rather than replacing with new Date().
+ */
+function parseSafeDate(raw: any): Date | undefined {
+  if (!raw || typeof raw !== "string") {
+    if (raw instanceof Date && !isNaN(raw.getTime())) return raw;
+    return undefined;
+  }
+  const str = raw.trim();
+  if (!str) return undefined;
+
+  // Handle SQL format "YYYY-MM-DD HH:mm:ss" by replacing space with 'T' if no timezone offset
+  const isoCandidate = str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str;
+  const d = new Date(isoCandidate);
+  if (!isNaN(d.getTime())) {
+    return d;
+  }
+
+  // Fallback direct parse attempt
+  const directDate = new Date(str);
+  return !isNaN(directDate.getTime()) ? directDate : undefined;
 }
 
 /**
@@ -77,39 +140,82 @@ function normalizeCallDirection(raw: string): "inbound" | "outbound" | "broadcas
  * Idempotent, deduplicated, matches lead safely by external ID or normalized phone.
  */
 export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): Promise<WebhookProcessingResult> {
-  const rawCallId = payload.call_id || payload.callId;
-  if (!rawCallId) {
+  // 1. Call ID validation
+  const rawCallId = payload.CallSessionId ?? payload.call_id ?? payload.callId;
+  if (rawCallId === undefined || rawCallId === null || String(rawCallId).trim() === "") {
     throw new Error("Missing mandatory 'call_id' in webhook payload.");
   }
   const callId = String(rawCallId).trim();
 
-  // Extract phone number from customer side
-  const rawCustomerPhone =
-    payload.caller_id_number ||
-    payload.customer_number ||
-    payload.call_to_number ||
-    "";
-  const customerNumber = String(rawCustomerPhone).trim();
-  const normalizedPhone = normalizePhoneNumber(customerNumber) || customerNumber.replace(/\D/g, "");
+  // 2. Direction normalization
+  const rawDirection = payload.Direction ?? payload.direction ?? "";
+  const direction = normalizeCallDirection(String(rawDirection));
 
-  // Duration calculations
-  const totalDuration = parseInt(String(payload.duration || 0), 10) || 0;
-  const answeredDuration = parseInt(String(payload.answered_duration || payload.billsec || 0), 10) || 0;
+  // 3. Customer phone extraction based on direction
+  // - Inbound: SourceNumber is the calling customer; DestinationNumber is company DID.
+  // - Outbound: DestinationNumber is the called customer; SourceNumber is agent/company DID.
+  // - Unknown: Safely inspect customer_number first, then SourceNumber / DestinationNumber.
+  let rawCustomerPhone = "";
+  if (direction === "inbound") {
+    rawCustomerPhone = String(
+      payload.SourceNumber ??
+      payload.caller_id_number ??
+      payload.customer_number ??
+      ""
+    );
+  } else if (direction === "outbound") {
+    rawCustomerPhone = String(
+      payload.DestinationNumber ??
+      payload.customer_number ??
+      payload.call_to_number ??
+      payload.SourceNumber ??
+      ""
+    );
+  } else {
+    // Missing or unknown direction: safely prioritize explicit customer_number, then SourceNumber, then DestinationNumber
+    rawCustomerPhone = String(
+      payload.customer_number ??
+      payload.SourceNumber ??
+      payload.caller_id_number ??
+      payload.DestinationNumber ??
+      payload.call_to_number ??
+      ""
+    );
+  }
 
-  // Timestamps
-  const startTime = payload.start_stamp || payload.calldate ? new Date(payload.start_stamp || payload.calldate!) : new Date();
-  const endTime = payload.end_stamp ? new Date(payload.end_stamp) : new Date();
+  const customerNumber = rawCustomerPhone.trim();
+  const normalizedPhone = customerNumber ? (normalizePhoneNumber(customerNumber) || customerNumber.replace(/\D/g, "")) : "";
 
-  // Recording URL
-  const recordingUrl = (payload.recording_url || payload.recordingUrl || "").trim();
+  // 4. Status normalization
+  const rawStatus = payload.Status ?? payload.call_status ?? payload.status ?? "";
+  const status = normalizeCallStatus(String(rawStatus));
+
+  // 5. Safe duration calculations
+  const totalDuration = parseSafeDuration(payload.CallDuration ?? payload.duration);
+  const answeredDuration = parseSafeDuration(payload.answered_duration ?? payload.billsec);
+
+  // 6. Safe timestamp parsing (preserves undefined if missing or invalid)
+  const rawStartTime = payload.StartTime ?? payload.start_stamp ?? payload.calldate;
+  const rawEndTime = payload.EndTime ?? payload.end_stamp;
+  const startTime = parseSafeDate(rawStartTime);
+  const endTime = parseSafeDate(rawEndTime);
+
+  // 7. Recording URL parsing
+  const rawRecordingUrl = payload.RecordingUrl ?? payload.RecordingURL ?? payload.recording_url ?? payload.recordingUrl ?? "";
+  const recordingUrl = typeof rawRecordingUrl === "string" ? rawRecordingUrl.trim() : "";
   const hasRecording = recordingUrl.length > 0;
 
-  // External CRM identifier passed back by dialer (custom parameter or explicit CRM id)
-  const externalLeadId = (
-    payload.crm_unique_id ||
-    payload.crm_lead_id ||
-    payload.custom_parameter_1 ||
-    payload.custom_parameter_2 ||
+  // 8. Agent and Display Number
+  const agentName = String(payload.answered_agent ?? payload.agent_name ?? payload.agent_id ?? "").trim();
+  const agentNumber = String(payload.answered_agent_number ?? "").trim();
+
+  // 9. External CRM identifier passed back by dialer (custom parameter or explicit CRM id)
+  const externalLeadId = String(
+    payload.crm_unique_id ??
+    payload.crm_lead_id ??
+    payload.custom_parameter_1 ??
+    payload.custom_parameter_2 ??
+    payload.custom_parameter_3 ??
     ""
   ).trim();
 
@@ -162,14 +268,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     refId: String(payload.ref_id || payload.refId || ""),
     customerNumber,
     normalizedCustomerPhone: normalizedPhone,
-    agentName: String(payload.answered_agent || payload.agent_name || payload.agent_id || ""),
-    agentNumber: String(payload.answered_agent_number || ""),
-    direction: normalizeCallDirection(payload.direction || ""),
-    status: normalizeCallStatus(payload.call_status || payload.status || ""),
+    agentName,
+    agentNumber,
+    direction,
+    status,
     durationSeconds: totalDuration,
     answeredDurationSeconds: answeredDuration,
-    startTime: isNaN(startTime.getTime()) ? new Date() : startTime,
-    endTime: isNaN(endTime.getTime()) ? new Date() : endTime,
+    startTime: startTime ?? undefined,
+    endTime: endTime ?? undefined,
     recordingUrl,
     recordingAvailable: hasRecording,
     disposition: String(payload.disposition || ""),

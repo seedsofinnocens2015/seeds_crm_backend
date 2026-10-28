@@ -13,9 +13,10 @@ const router = Router();
 
 // All member management routes require authentication and either admin or team_leader role
 router.use(requireAuth);
-router.use(requireRole(["admin", "team_leader"]));
-
 router.get("/", getMembers);
+
+// Modification operations require admin or team_leader
+router.use(requireRole(["admin", "team_leader"]));
 router.post("/", createMember);
 router.get("/:id", getMemberById);
 router.put("/:id", updateMember);

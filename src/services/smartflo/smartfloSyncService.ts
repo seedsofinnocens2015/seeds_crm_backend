@@ -2,41 +2,74 @@ import { config } from "../../config/env.js";
 import { Lead, ILead } from "../../models/Lead.js";
 import { SmartfloLeadJob, ISmartfloLeadJob } from "../../models/SmartfloLeadJob.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
+import { getSmartfloAccessToken, invalidateSmartfloAccessToken } from "./smartfloAuthService.js";
 
 export interface SmartfloLeadPayload {
   field_0: string; // Mandatory: Primary phone number
-  field_1?: string; // Lead Name (Wife name / Husband name)
-  field_2?: string; // Email
-  field_3?: string; // Centre Location
+  field_1: string; // Mandatory: Lead / Couple Name
+  field_2?: string; // Email (primary or secondary)
+  field_3?: string; // Patient Address (falls back to City, State or Location)
   field_4?: string; // Stable CRM Lead Unique ID (e.g. SOI-1234)
-  field_5?: string; // Lead Source / Campaign
+  field_5?: string; // Alternate phone number (secondary or whatsapp)
   [key: string]: any;
 }
 
 /**
- * Maps a CRM Lead document or lead data object to Smartflo's broadcast lead payload.
+ * Maps a CRM Lead document or lead data object to Smartflo's contact group payload.
+ * Field mapping specification:
+ * - field_0: primary mobile number (normalized digits/E.164)
+ * - field_1: couple / patient name with fallback
+ * - field_2: primary email, or secondary email
+ * - field_3: patient address (ptAddress or ptCity, ptState or centreLocation)
+ * - field_4: stable CRM unique ID (e.g. SOI-1042)
+ * - field_5: alternate mobile number (secondaryMobileNumber or whatsappMobileNumber)
+ * Note: Never puts leadSource or campaignName in field_5.
  */
 export function mapLeadToSmartfloPayload(lead: any): SmartfloLeadPayload {
   const phone = lead.primaryMobileNumber || lead.mobileNumber || lead.phoneNumber || "";
   const normalizedPhone = normalizePhoneNumber(phone) || phone.replace(/\D/g, "");
 
-  // Build couple/lead name
+  // Build couple/lead name with graceful fallbacks
   const nameParts = [lead.wifeName || lead.patientName, lead.husbandName || lead.spouseName].filter(Boolean);
   const leadName = nameParts.join(" & ") || (lead.wifeName || lead.husbandName || lead.patientName || "Valued Patient");
 
+  // Email: primary or secondary
   const email = (lead.primaryEmail || lead.secondaryEmail || "").trim();
-  const location = (lead.centreLocation || lead.location || lead.campLocation || "").trim();
-  const uniqueId = (lead.uniqueId || "").trim();
-  const source = (lead.leadSource || lead.campaignName || lead.source || "").trim();
+
+  // Address: ptAddress, falling back to city/state, falling back to centre/camp location
+  const cityState = [lead.ptCity, lead.ptState].filter(Boolean).map((s: string) => s.trim()).join(", ");
+  const rawAddress = lead.ptAddress || cityState || lead.centreLocation || lead.location || lead.campLocation || "";
+  const address = String(rawAddress).trim();
+
+  // Stable CRM unique ID
+  const uniqueId = String(lead.uniqueId || "").trim();
+
+  // Alternate phone number (secondaryMobileNumber or whatsappMobileNumber or alternateNumber)
+  const rawAltPhone = lead.secondaryMobileNumber || lead.whatsappMobileNumber || lead.alternateNumber || "";
+  const altPhoneDigits = String(rawAltPhone).trim();
+  const normalizedAltPhone = altPhoneDigits ? (normalizePhoneNumber(altPhoneDigits) || altPhoneDigits.replace(/\D/g, "")) : "";
 
   return {
     field_0: normalizedPhone,
     field_1: leadName,
     field_2: email,
-    field_3: location,
+    field_3: address,
     field_4: uniqueId,
-    field_5: source,
+    field_5: normalizedAltPhone,
   };
+}
+
+/**
+ * Resolves the target list ID based on the explicit sync type.
+ * - 'broadcast': prefers SMARTFLO_BROADCAST_LIST_ID, then fallback to SMARTFLO_LEAD_LIST_ID
+ * - 'contact': prefers SMARTFLO_CONTACT_GROUP_ID, then fallback to SMARTFLO_LEAD_LIST_ID
+ */
+export function getTargetListId(customId?: string): string {
+  if (customId) return customId;
+  if (config.smartfloSyncType === "broadcast") {
+    return config.smartfloBroadcastListId || config.smartfloLeadListId || "";
+  }
+  return config.smartfloContactGroupId || config.smartfloLeadListId || "";
 }
 
 /**
@@ -44,7 +77,7 @@ export function mapLeadToSmartfloPayload(lead: any): SmartfloLeadPayload {
  * Non-blocking, durable, safe against duplicates.
  */
 export async function enqueueLeadForSmartflo(leadId: any, uniqueId: string, customListId?: string): Promise<ISmartfloLeadJob | null> {
-  const targetListId = customListId || config.smartfloLeadListId;
+  const targetListId = getTargetListId(customListId);
 
   // If no target list is configured yet, do not create an unroutable job
   if (!targetListId) {
@@ -93,7 +126,7 @@ export async function enqueueLeadForSmartflo(leadId: any, uniqueId: string, cust
  * Used during CSV/Excel bulk uploads.
  */
 export async function enqueueBulkLeadsForSmartflo(leads: Array<{ _id: any; uniqueId: string }>, customListId?: string): Promise<number> {
-  const targetListId = customListId || config.smartfloLeadListId;
+  const targetListId = getTargetListId(customListId);
   if (!targetListId || !leads.length) return 0;
 
   let enqueuedCount = 0;
@@ -134,11 +167,20 @@ export async function enqueueBulkLeadsForSmartflo(leads: Array<{ _id: any; uniqu
   return enqueuedCount;
 }
 
+export interface ProcessJobOptions {
+  bypassSyncEnabledFlag?: boolean;
+}
+
 /**
  * Processes a single Smartflo sync job with timeout, exponential backoff, and idempotency handling.
  */
-export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = fetch): Promise<boolean> {
-  if (!config.smartfloSyncEnabled) {
+export async function processSmartfloJob(
+  jobId: string,
+  fetchFn: typeof fetch = fetch,
+  options?: ProcessJobOptions
+): Promise<boolean> {
+  const allowBypass = options?.bypassSyncEnabledFlag === true;
+  if (!config.smartfloSyncEnabled && !allowBypass) {
     return false;
   }
 
@@ -167,9 +209,12 @@ export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = 
 
   const job = claimedJob;
 
-  if (!config.smartfloApiToken) {
+  let accessToken: string;
+  try {
+    accessToken = await getSmartfloAccessToken(fetchFn);
+  } catch (authErr: any) {
     job.status = "pending";
-    job.lastError = "Smartflo API Token is not configured (SMARTFLO_API_TOKEN is empty).";
+    job.lastError = `Smartflo authentication failed: ${authErr.message}`;
     await job.save();
     return false;
   }
@@ -192,27 +237,80 @@ export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = 
     return false;
   }
 
+  // Target ID guard: Ensure the job's targetLeadListId matches the active configuration.
+  // This prevents immediate execution or manual retry from sending a job to the wrong API endpoint type.
+  const activeTargetId = getTargetListId();
+  if (!activeTargetId) {
+    job.status = "pending";
+    job.lastError = "No active Smartflo target ID configured for current sync type.";
+    await job.save();
+    return false;
+  }
+
+  if (job.targetLeadListId !== activeTargetId) {
+    job.status = "pending";
+    job.lastError = `Target list mismatch: job targets '${job.targetLeadListId}', but active '${config.smartfloSyncType}' target is '${activeTargetId}'. Job skipped to avoid cross-endpoint sync.`;
+    await job.save();
+    return false;
+  }
+
   job.requestPayload = payload;
   await job.save();
 
-  const url = `${config.smartfloApiBaseUrl}/broadcast/lead/${job.targetLeadListId}`;
-  const controller = new AbortController();
+  // Determine endpoint URL and request payload envelope strictly by explicit configuration
+  const isBroadcast = config.smartfloSyncType === "broadcast";
+  const url = isBroadcast
+    ? `${config.smartfloApiBaseUrl.replace(/\/+$/, "")}/broadcast/leads/${job.targetLeadListId}`
+    : `${config.smartfloApiBaseUrl.replace(/\/+$/, "")}/contact/${job.targetLeadListId}`;
+
+  const requestBody = isBroadcast
+    ? JSON.stringify({
+        data: [payload],
+        duplicate_option: "skip",
+      })
+    : JSON.stringify(payload);
+
   const timeoutMs = 15000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Helper for making contact / broadcast lead POST request with current token
+  const executePost = async (token: string) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetchFn(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: requestBody,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return resp;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  };
 
   try {
-    const response = await fetchFn(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.smartfloApiToken}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
+    let response = await executePost(accessToken);
 
-    clearTimeout(timeoutId);
+    // On Smartflo API 401 response: invalidate cached token, obtain a fresh token, and retry only once
+    if (response.status === 401) {
+      invalidateSmartfloAccessToken();
+      try {
+        const freshToken = await getSmartfloAccessToken(fetchFn);
+        response = await executePost(freshToken);
+      } catch (refreshErr: any) {
+        job.status = "pending";
+        job.lastError = `Smartflo 401 token refresh failed: ${refreshErr.message}`;
+        await job.save();
+        return false;
+      }
+    }
 
     const responseText = await response.text();
     let responseData: any = {};
@@ -228,7 +326,15 @@ export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = 
     if (response.ok) {
       job.status = "synced";
       job.lastError = "";
-      job.smartfloLeadId = responseData?.id || responseData?.lead_id || responseData?.data?.id || "";
+      // Handle Contact Group response ({ id: 123 }), Broadcast direct ({ id: 123 } / { data: [{ id: 123 }] }), or Broadcast async batch ({ batch_id: "..." })
+      const leadIdFromResponse =
+        responseData?.id ||
+        responseData?.lead_id ||
+        (Array.isArray(responseData?.data) && responseData.data[0]?.id) ||
+        responseData?.data?.id ||
+        responseData?.batch_id ||
+        "";
+      job.smartfloLeadId = String(leadIdFromResponse);
       job.completedAt = new Date();
       await job.save();
       return true;
@@ -262,15 +368,26 @@ export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = 
     await job.save();
     return false;
   } catch (err: any) {
-    clearTimeout(timeoutId);
     const isTimeout = err.name === "AbortError";
     const errMsg = isTimeout ? "Request timed out after 15s" : err.message || "Network error";
 
+    // Ambiguous network timeouts should NOT be blindly retried automatically because
+    // the contact might have already been created on Smartflo before the response reached CRM.
+    // Marking as failed with clear manual reconciliation guidance avoids creating duplicate contacts.
+    if (isTimeout) {
+      job.status = "failed";
+      job.lastError = `${errMsg}. Ambiguous network outcome: Contact may have been created on Smartflo. Manual verification in Smartflo group required before retry.`;
+      job.completedAt = new Date();
+      await job.save();
+      return false;
+    }
+
+    // General connection reset or DNS failure before TCP socket completion can be retried safely
     if (job.attempts < job.maxAttempts) {
       job.status = "pending";
       const backoffSec = Math.pow(2, job.attempts) * 15;
       job.scheduledAt = new Date(Date.now() + backoffSec * 1000);
-      job.lastError = `${errMsg}. Scheduled retry in ${backoffSec}s. Note: Check Smartflo list in case request succeeded before timeout.`;
+      job.lastError = `${errMsg}. Scheduled retry in ${backoffSec}s.`;
       await job.save();
     } else {
       job.status = "failed";
@@ -285,15 +402,29 @@ export async function processSmartfloJob(jobId: string, fetchFn: typeof fetch = 
 
 /**
  * Scans and executes pending jobs whose scheduledAt <= now.
+ * Strictly isolates job processing to the active targetLeadListId.
  */
 export async function runPendingSmartfloJobs(limit: number = 50): Promise<number> {
-  if (!config.smartfloSyncEnabled || !config.smartfloApiToken) {
+  const activeTargetId = getTargetListId();
+  if (!activeTargetId) {
     return 0;
   }
 
-  // Include pending eligible jobs as well as any orphaned jobs stuck in "processing" past stale threshold
+  const isConfigured = Boolean(
+    config.smartfloSyncEnabled &&
+    config.smartfloLoginId &&
+    config.smartfloPassword
+  );
+
+  if (!isConfigured) {
+    return 0;
+  }
+
+  // Include pending eligible jobs as well as any orphaned jobs stuck in "processing" past stale threshold,
+  // strictly filtered by the active targetLeadListId to prevent cross-endpoint job contamination.
   const staleThreshold = new Date(Date.now() - 5 * 60 * 1000);
   const eligibleJobs = await SmartfloLeadJob.find({
+    targetLeadListId: activeTargetId,
     $or: [
       { status: "pending", scheduledAt: { $lte: new Date() } },
       { status: "processing", updatedAt: { $lte: staleThreshold } },

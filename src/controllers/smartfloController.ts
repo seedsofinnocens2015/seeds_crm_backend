@@ -320,6 +320,47 @@ export async function retrySmartfloSyncJob(req: Request, res: Response) {
 }
 
 /**
+ * POST /api/v1/integrations/smartflo/jobs/:jobId/test-sync
+ * Strictly scoped Admin-only test execution endpoint for a single, explicitly selected job.
+ * Allows controlled testing of an approved dummy job when SMARTFLO_SYNC_ENABLED=false.
+ * Strictly checks that:
+ * 1. User is authenticated with admin role.
+ * 2. Only the single jobId in the route is targeted (cannot trigger queue, batch, or scheduler).
+ * 3. The job's targetLeadListId matches the active configuration (cannot cross-sync).
+ */
+export async function testSyncSingleSmartfloJob(req: Request, res: Response) {
+  try {
+    const { jobId } = req.params;
+    const job = await SmartfloLeadJob.findById(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Sync job not found" });
+    }
+
+    // Set to pending so processSmartfloJob can atomically claim it
+    job.status = "pending";
+    job.scheduledAt = new Date();
+    await job.save();
+
+    // Execute only this single job with explicit test bypass
+    const success = await processSmartfloJob(job._id.toString(), fetch, {
+      bypassSyncEnabledFlag: true,
+    });
+
+    const updatedJob = await SmartfloLeadJob.findById(jobId).lean();
+    return res.status(200).json({
+      success,
+      job: updatedJob,
+      message: success
+        ? "Test job successfully executed with Smartflo"
+        : `Test job processing failed: ${updatedJob?.lastError || "Check logs"}`,
+    });
+  } catch (error: any) {
+    console.error("[Smartflo Test-Sync Error]:", error.message);
+    return res.status(500).json({ error: error.message || "Failed to execute test sync" });
+  }
+}
+
+/**
  * POST /api/v1/integrations/smartflo/cdr-sync
  * Triggers CDR reconciliation for a specified date range.
  */

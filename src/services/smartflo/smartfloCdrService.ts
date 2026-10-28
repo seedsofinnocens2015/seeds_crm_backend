@@ -1,4 +1,5 @@
 import { config } from "../../config/env.js";
+import { getSmartfloAccessToken } from "./smartfloAuthService.js";
 import { processSmartfloWebhook, SmartfloWebhookPayload } from "./smartfloWebhookService.js";
 
 export interface SmartfloCdrResultItem {
@@ -43,8 +44,11 @@ export async function syncSmartfloCdrRange(
     errors: 0,
   };
 
-  if (!config.smartfloApiToken) {
-    throw new Error("Smartflo API token is missing. Please configure SMARTFLO_API_TOKEN.");
+  let accessToken: string;
+  try {
+    accessToken = await getSmartfloAccessToken(fetchFn);
+  } catch (authErr: any) {
+    throw new Error(`Smartflo authentication failed: ${authErr.message}`);
   }
 
   let page = 1;
@@ -61,7 +65,7 @@ export async function syncSmartfloCdrRange(
     const response = await fetchFn(url.toString(), {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${config.smartfloApiToken}`,
+        Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
       },
     });
