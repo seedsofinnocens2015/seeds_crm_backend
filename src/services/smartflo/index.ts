@@ -4,3 +4,4 @@ export * from "./smartfloWebhookService.js";
 export * from "./smartfloCdrService.js";
 export * from "./smartfloScheduler.js";
 export * from "./smartfloClickToCallService.js";
+export * from "./smartfloHangupService.js";

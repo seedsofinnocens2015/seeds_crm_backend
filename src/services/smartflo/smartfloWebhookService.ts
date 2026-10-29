@@ -300,6 +300,12 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
 
   // Atomically upsert call record
+  // If a pending record was created by click-to-call matching ref_id, reconcile and upgrade it to official callId
+  const existingByRef = updateData.refId ? await SmartfloCallLog.findOne({ refId: updateData.refId }) : null;
+  if (existingByRef && existingByRef.callId.startsWith("C2C_PENDING_")) {
+    await SmartfloCallLog.deleteOne({ _id: existingByRef._id });
+  }
+
   const existingRecord = await SmartfloCallLog.findOne({ callId });
   const isDuplicate = !!existingRecord;
 

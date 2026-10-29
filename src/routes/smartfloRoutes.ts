@@ -9,6 +9,7 @@ import {
   testSyncSingleSmartfloJob,
   triggerCdrReconciliation,
   handleClickToCall,
+  handleHangupCall,
 } from "../controllers/smartfloController.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/roleGuard.js";
@@ -38,6 +39,9 @@ router.get("/recording/:callId", requireAuth, streamCallRecording);
 
 // Initiate outbound Click-to-Call connection
 router.post("/click-to-call", requireAuth, handleClickToCall);
+
+// Terminate active/in-progress call
+router.post("/hangup", requireAuth, handleHangupCall);
 
 /**
  * 4. Admin & Team Leader Integration Management

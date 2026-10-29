@@ -177,6 +177,37 @@ export async function initiateSmartfloClickToCall(
   // Register in debounce cache upon successful acceptance
   recentCallsMap.set(debounceKey, now);
 
+  // Persist pending Click-to-Call log in SmartfloCallLog with ref_id if available
+  const returnedRefId = resJson.ref_id ? String(resJson.ref_id).trim() : "";
+  if (returnedRefId) {
+    try {
+      const { SmartfloCallLog } = await import("../../models/SmartfloCallLog.js");
+      await SmartfloCallLog.findOneAndUpdate(
+        { refId: returnedRefId },
+        {
+          $setOnInsert: {
+            callId: `C2C_PENDING_${returnedRefId}`,
+            refId: returnedRefId,
+            customerNumber: destinationNumber,
+            normalizedCustomerPhone: normalizedDigits,
+            agentName: user.name || "Agent",
+            agentNumber: resolvedAgent,
+            direction: "outbound",
+            status: "in_progress",
+            crmLeadId: lead._id,
+            crmLeadUniqueId: lead.uniqueId,
+            matchingMethod: "crm_unique_id",
+            recordingAvailable: false,
+            receivedAt: new Date(),
+          },
+        },
+        { upsert: true, new: true }
+      );
+    } catch (saveErr: any) {
+      console.warn("[Smartflo ClickToCall] Notice: could not pre-create pending call log:", saveErr.message);
+    }
+  }
+
   return {
     success: true,
     refId: resJson.ref_id,

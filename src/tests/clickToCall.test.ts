@@ -442,6 +442,132 @@ async function runClickToCallTests() {
       Lead.findByIdAndUpdate = origLeadFindByIdAndUpdate;
     }
 
+    // ----------------------------------------------------
+    // Test 10: Call Hangup Service & Controller Tests
+    // ----------------------------------------------------
+    {
+      const { executeSmartfloCallHangup, _clearHangupDebounceMap } = await import("../services/smartflo/smartfloHangupService.js");
+      const { handleHangupCall } = await import("../controllers/smartfloController.js");
+
+      _clearHangupDebounceMap();
+      let hangupUrl = "";
+      let hangupOptions: any = null;
+
+      const mockHangupFetch: any = async (url: string, options: any) => {
+        hangupUrl = url;
+        hangupOptions = options;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            message: "Call hangup successful",
+          }),
+        };
+      };
+
+      // 1. Hangup via ref_id
+      const resHangupRef = await executeSmartfloCallHangup({ refId: "REF_TEST_999" }, mockHangupFetch, () => 200000);
+      assert("Hangup via ref_id succeeds", resHangupRef.success === true);
+      assert("Dispatches to /v1/call/hangup endpoint", hangupUrl === "https://api-smartflo.mock/v1/call/hangup");
+      assert("Attaches Bearer auth token header on hangup", hangupOptions.headers.Authorization === "Bearer MOCK_SMARTFLO_JWT_TOKEN");
+      const parsedBody = JSON.parse(hangupOptions.body);
+      assert("Body contains ref_id", parsedBody.ref_id === "REF_TEST_999");
+      assert("Body does not contain call_id when ref_id is passed", parsedBody.call_id === undefined);
+
+      // 2. Hangup via call_id
+      hangupUrl = "";
+      hangupOptions = null;
+      const resHangupCall = await executeSmartfloCallHangup({ callId: "CALL_SESSION_888" }, mockHangupFetch, () => 200001);
+      assert("Hangup via call_id succeeds", resHangupCall.success === true);
+      const parsedCallBody = JSON.parse(hangupOptions.body);
+      assert("Body contains call_id", parsedCallBody.call_id === "CALL_SESSION_888");
+      assert("Body does not contain ref_id when call_id is passed", parsedCallBody.ref_id === undefined);
+
+      // 3. Rejects when neither identifier is passed
+      let threwEmpty = false;
+      try {
+        await executeSmartfloCallHangup({}, mockHangupFetch);
+      } catch (e: any) {
+        threwEmpty = true;
+        assert("Throws error when both refId and callId are missing", e.message.includes("Missing call identifier"));
+      }
+      assert("Empty identifier threw error", threwEmpty);
+
+      // 4. Double-click debounce on hangup
+      let clock = 300000;
+      await executeSmartfloCallHangup({ refId: "REF_DEBOUNCE_1" }, mockHangupFetch, () => clock);
+      let debounced = false;
+      try {
+        await executeSmartfloCallHangup({ refId: "REF_DEBOUNCE_1" }, mockHangupFetch, () => clock + 2000);
+      } catch (e: any) {
+        debounced = true;
+        assert("Second rapid hangup click within 5s is blocked by debounce guard", e.message.includes("hangup request for this call was just submitted"));
+      }
+      assert("Hangup debounce guard triggered", debounced);
+
+      // 5. Smartflo API Rejection handling
+      const mockHangupReject: any = async () => ({
+        ok: false,
+        status: 400,
+        text: async () => JSON.stringify({ success: false, message: "Call has already ended." }),
+      });
+
+      let threwReject = false;
+      try {
+        await executeSmartfloCallHangup({ refId: "REF_REJECT_1" }, mockHangupReject);
+      } catch (e: any) {
+        threwReject = true;
+        assert("Surfaces Smartflo hangup HTTP error", e.message.includes("Smartflo Call Hangup error (HTTP 400)"));
+      }
+      assert("API rejection threw error", threwReject);
+
+      // 6. Controller Authorization Guard (Agent can only hang up their own lead)
+      const origLeadFindOne = Lead.findOne;
+      const leadOwnedByAgentA: any = {
+        _id: "lead_a_id",
+        uniqueId: "SOI-101",
+        callerName: "Agent Aarti",
+        leadOwner: "Agent Aarti",
+      };
+
+      (Lead as any).findOne = () => ({
+        then: (resolve: any) => resolve(leadOwnedByAgentA),
+      });
+
+      let statusReceived = 0;
+      let jsonReceived: any = null;
+      const mockRes: any = {
+        status: (code: number) => {
+          statusReceived = code;
+          return {
+            json: (payload: any) => {
+              jsonReceived = payload;
+            },
+          };
+        },
+      };
+
+      const reqUnauthorizedAgent: any = {
+        user: {
+          id: "bob_user_id",
+          name: "Agent Bob",
+          email: "bob@seedscrm.com",
+          role: "agent",
+        },
+        body: {
+          leadId: "SOI-101",
+          refId: "REF_RBAC_TEST",
+        },
+      };
+
+      await handleHangupCall(reqUnauthorizedAgent, mockRes);
+      assert("Agent cannot hang up call for lead assigned to another caller/owner (HTTP 403)", statusReceived === 403);
+      assert("403 error explains hangup access restriction", jsonReceived?.error?.includes("Access denied"));
+
+      Lead.findOne = origLeadFindOne;
+    }
+
   } finally {
     // Restore original configs
     config.smartfloCallerId = origCallerId;

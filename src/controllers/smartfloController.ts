@@ -12,6 +12,7 @@ import {
   syncSmartfloCdrRange,
   mapLeadToSmartfloPayload,
   initiateSmartfloClickToCall,
+  executeSmartfloCallHangup,
 } from "../services/smartflo/index.js";
 
 export type WebhookAuthResult = "ok" | "unconfigured" | "unauthorized";
@@ -174,6 +175,7 @@ export async function getLeadCallHistory(req: Request, res: Response) {
     const safeCalls = calls.map((c) => ({
       id: c._id,
       callId: c.callId,
+      refId: c.refId || "",
       direction: c.direction,
       status: c.status,
       customerNumber: c.customerNumber,
@@ -457,6 +459,79 @@ export async function handleClickToCall(req: Request, res: Response) {
       msg.includes("Access denied") ? 403 :
       msg.includes("not found") ? 404 :
       msg.includes("Invalid") || msg.includes("Missing") || msg.includes("blocked") || msg.includes("wait") || msg.includes("not configured")
+        ? 400
+        : 500;
+
+    return res.status(statusCode).json({ error: msg });
+  }
+}
+
+/**
+ * POST /api/v1/integrations/smartflo/hangup
+ * Terminates an active/in-progress call via Tata Smartflo Call Hangup API.
+ * Authenticated via CRM user JWT (requireAuth).
+ * Authorizes access based on lead ownership for agent role.
+ */
+export async function handleHangupCall(req: Request, res: Response) {
+  try {
+    const session = req.user;
+    if (!session) {
+      return res.status(401).json({ error: "Unauthorized. Authentication session required." });
+    }
+
+    const { leadId, refId, callId } = req.body;
+    if (!leadId) {
+      return res.status(400).json({ error: "Missing required 'leadId' parameter." });
+    }
+    if (!refId && !callId) {
+      return res.status(400).json({ error: "Missing call identifier: either 'refId' or 'callId' is required." });
+    }
+
+    // 1. Locate Lead document (supports MongoDB ObjectId or uniqueId e.g. SOI-1042)
+    const query: any = {
+      $or: [{ uniqueId: leadId }],
+    };
+    if (mongoose.isValidObjectId(leadId)) {
+      query.$or.push({ _id: leadId });
+    }
+
+    const lead = await Lead.findOne(query);
+    if (!lead) {
+      return res.status(404).json({ error: "Lead not found." });
+    }
+
+    // 2. Role-based Access Control: agents can only hang up calls for leads assigned to them
+    if (session.role === "agent") {
+      const agentName = (session.name || "").trim().toLowerCase();
+      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
+      const callerName = (lead.callerName || "").trim().toLowerCase();
+
+      if (leadOwner !== agentName && callerName !== agentName) {
+        return res.status(403).json({
+          error: "Access denied. You can only manage calls for leads assigned to you.",
+        });
+      }
+    }
+
+    // 3. Dispatch Call Hangup request via dedicated service
+    const result = await executeSmartfloCallHangup({
+      refId,
+      callId,
+    });
+
+    return res.status(200).json({
+      status: "success",
+      message: result.message,
+      identifierType: result.identifierType,
+      identifierValue: result.identifierValue,
+    });
+  } catch (error: any) {
+    console.error("[Smartflo Call Hangup Error]:", error.message);
+    const msg = error.message || "Failed to hang up call";
+    const statusCode =
+      msg.includes("Access denied") ? 403 :
+      msg.includes("not found") ? 404 :
+      msg.includes("Missing") || msg.includes("wait") || msg.includes("rejected")
         ? 400
         : 500;
 
