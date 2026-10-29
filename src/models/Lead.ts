@@ -296,7 +296,6 @@ const LeadSchema = new Schema<ILead>(
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
     utmSource: {
       type: String,
@@ -329,19 +328,16 @@ const LeadSchema = new Schema<ILead>(
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
     leadStage: {
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
     leadValidStatus: {
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
 
     // Creator & Modifier Details
@@ -419,7 +415,6 @@ const LeadSchema = new Schema<ILead>(
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
     followUpDateTime: {
       type: String,
