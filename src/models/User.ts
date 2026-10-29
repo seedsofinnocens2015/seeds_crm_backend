@@ -7,6 +7,8 @@ export interface IUser extends Document {
   password?: string;
   role: "admin" | "team_leader" | "agent" | "mis" | "marketing";
   status?: "active" | "inactive";
+  smartfloAgentNumber?: string; // Smartflo Agent Mobile, Agent ID (050xxxx), or Softphone Extension (060xxxx)
+  smartfloCallerId?: string; // Optional user-specific outbound CLI override
   createdBy?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -44,6 +46,16 @@ const UserSchema = new Schema<IUser>(
       type: String,
       enum: ["active", "inactive"],
       default: "active",
+    },
+    smartfloAgentNumber: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    smartfloCallerId: {
+      type: String,
+      default: "",
+      trim: true,
     },
     createdBy: {
       type: Schema.Types.ObjectId,

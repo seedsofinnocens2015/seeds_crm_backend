@@ -55,6 +55,7 @@ export interface SmartfloWebhookPayload {
   recordingUrl?: string;
 
   // Custom Lead Tracking parameters
+  custom_identifier?: Record<string, any>;
   custom_parameter_1?: string; // May carry CRM Unique ID e.g. "SOI-101"
   custom_parameter_2?: string;
   custom_parameter_3?: string;
@@ -209,8 +210,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const agentName = String(payload.answered_agent ?? payload.agent_name ?? payload.agent_id ?? "").trim();
   const agentNumber = String(payload.answered_agent_number ?? "").trim();
 
-  // 9. External CRM identifier passed back by dialer (custom parameter or explicit CRM id)
+  // 9. External CRM identifier passed back by dialer (custom parameter, custom_identifier, or explicit CRM id)
+  const customIdent = payload.custom_identifier && typeof payload.custom_identifier === "object"
+    ? payload.custom_identifier
+    : {};
+
   const externalLeadId = String(
+    customIdent.lead_unique_id ??
+    customIdent.lead_id ??
     payload.crm_unique_id ??
     payload.crm_lead_id ??
     payload.custom_parameter_1 ??

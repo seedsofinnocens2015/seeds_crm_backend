@@ -8,6 +8,7 @@ import {
   retrySmartfloSyncJob,
   testSyncSingleSmartfloJob,
   triggerCdrReconciliation,
+  handleClickToCall,
 } from "../controllers/smartfloController.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/roleGuard.js";
@@ -34,6 +35,9 @@ router.get("/calls/:leadId", requireAuth, getLeadCallHistory);
 
 // Secure streaming/redirect to call recording
 router.get("/recording/:callId", requireAuth, streamCallRecording);
+
+// Initiate outbound Click-to-Call connection
+router.post("/click-to-call", requireAuth, handleClickToCall);
 
 /**
  * 4. Admin & Team Leader Integration Management

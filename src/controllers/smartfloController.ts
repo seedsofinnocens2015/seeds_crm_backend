@@ -1,7 +1,8 @@
 import { Request, Response } from "express";
-import mongoose from "express";
+import mongoose from "mongoose";
 import { config } from "../config/env.js";
 import { Lead } from "../models/Lead.js";
+import { User } from "../models/User.js";
 import { SmartfloLeadJob } from "../models/SmartfloLeadJob.js";
 import { SmartfloCallLog } from "../models/SmartfloCallLog.js";
 import {
@@ -10,6 +11,7 @@ import {
   runPendingSmartfloJobs,
   syncSmartfloCdrRange,
   mapLeadToSmartfloPayload,
+  initiateSmartfloClickToCall,
 } from "../services/smartflo/index.js";
 
 export type WebhookAuthResult = "ok" | "unconfigured" | "unauthorized";
@@ -379,5 +381,85 @@ export async function triggerCdrReconciliation(req: Request, res: Response) {
   } catch (error: any) {
     console.error("[Smartflo CDR Sync Error]:", error.message);
     return res.status(500).json({ error: error.message || "CDR reconciliation failed" });
+  }
+}
+
+/**
+ * POST /api/v1/integrations/smartflo/click-to-call
+ * Initiates an outbound Click-to-Call connection.
+ * Authenticated via CRM user JWT (requireAuth).
+ * Authorizes access based on lead ownership for agent role.
+ */
+export async function handleClickToCall(req: Request, res: Response) {
+  try {
+    const session = req.user;
+    if (!session) {
+      return res.status(401).json({ error: "Unauthorized. Authentication session required." });
+    }
+
+    const { leadId, targetPhoneOverride, callTimeoutSeconds } = req.body;
+    if (!leadId) {
+      return res.status(400).json({ error: "Missing required 'leadId' parameter." });
+    }
+
+    // 1. Locate Lead document (supports MongoDB ObjectId or uniqueId e.g. SOI-1042)
+    const query: any = {
+      $or: [{ uniqueId: leadId }],
+    };
+    if (mongoose.isValidObjectId(leadId)) {
+      query.$or.push({ _id: leadId });
+    }
+
+    const lead = await Lead.findOne(query);
+    if (!lead) {
+      return res.status(404).json({ error: "Lead not found." });
+    }
+
+    // 2. Role-based Access Control: agents can only call their assigned leads
+    if (session.role === "agent") {
+      const agentName = (session.name || "").trim().toLowerCase();
+      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
+      const callerName = (lead.callerName || "").trim().toLowerCase();
+
+      if (leadOwner !== agentName && callerName !== agentName) {
+        return res.status(403).json({
+          error: "Access denied. You can only initiate calls to leads assigned to you.",
+        });
+      }
+    }
+
+    // 3. Resolve User record for Smartflo telephony configuration
+    const user = await User.findById(session.id);
+    if (!user) {
+      return res.status(404).json({ error: "User profile not found." });
+    }
+
+    // 4. Dispatch Click-to-Call request via dedicated service
+    const result = await initiateSmartfloClickToCall({
+      lead,
+      user,
+      targetPhoneOverride,
+      callTimeoutSeconds,
+    });
+
+    return res.status(200).json({
+      status: "success",
+      message: result.message,
+      refId: result.refId,
+      leadUniqueId: result.leadUniqueId,
+      customerNumber: result.customerNumber,
+      agentNumber: result.agentNumber,
+    });
+  } catch (error: any) {
+    console.error("[Smartflo Click-to-Call Error]:", error.message);
+    const msg = error.message || "Failed to initiate click-to-call";
+    const statusCode =
+      msg.includes("Access denied") ? 403 :
+      msg.includes("not found") ? 404 :
+      msg.includes("Invalid") || msg.includes("Missing") || msg.includes("blocked") || msg.includes("wait") || msg.includes("not configured")
+        ? 400
+        : 500;
+
+    return res.status(statusCode).json({ error: msg });
   }
 }

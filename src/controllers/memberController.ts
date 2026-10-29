@@ -35,7 +35,7 @@ export async function getMembers(req: Request, res: Response) {
 export async function createMember(req: Request, res: Response) {
   try {
     const authUser = req.user!;
-    const { name, mobile, email, password, role } = req.body;
+    const { name, mobile, email, password, role, smartfloAgentNumber } = req.body;
 
     if (!name || !mobile || !email || !password || !role) {
       return res.status(400).json({
@@ -77,6 +77,7 @@ export async function createMember(req: Request, res: Response) {
       password: hashedPassword,
       role: cleanRole,
       status: "active",
+      smartfloAgentNumber: smartfloAgentNumber ? String(smartfloAgentNumber).trim() : "",
       createdBy: new mongoose.Types.ObjectId(authUser.id),
     });
 
@@ -98,6 +99,7 @@ export async function createMember(req: Request, res: Response) {
         email: newMember.email,
         role: newMember.role,
         status: newMember.status || "active",
+        smartfloAgentNumber: newMember.smartfloAgentNumber || "",
         createdAt: newMember.createdAt,
       },
     });
@@ -159,7 +161,7 @@ export async function updateMember(req: Request, res: Response) {
     }
 
     const body = req.body;
-    const { name, mobile, email, role, status, password } = body;
+    const { name, mobile, email, role, status, password, smartfloAgentNumber } = body;
 
     const member = await User.findById(id);
     if (!member) {
@@ -203,6 +205,9 @@ export async function updateMember(req: Request, res: Response) {
     }
     if (status && ["active", "inactive"].includes(status)) {
       updateFields.status = status;
+    }
+    if (smartfloAgentNumber !== undefined) {
+      updateFields.smartfloAgentNumber = String(smartfloAgentNumber).trim();
     }
 
     // Optional password reset

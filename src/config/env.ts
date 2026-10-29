@@ -25,6 +25,7 @@ export interface AppConfig {
   smartfloSyncEnabled: boolean;
   smartfloWebhookSecret: string;
   smartfloApiKey: string; // Key for Smartflo custom connector to query CRM read endpoints
+  smartfloCallerId: string; // Account-approved outbound Caller ID / Pilot DID for Click-to-Call
 }
 
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -69,4 +70,5 @@ export const config: AppConfig = {
   smartfloSyncEnabled: process.env.SMARTFLO_SYNC_ENABLED === "0",
   smartfloWebhookSecret: process.env.SMARTFLO_WEBHOOK_SECRET || "",
   smartfloApiKey: process.env.SMARTFLO_API_KEY || "",
+  smartfloCallerId: process.env.SMARTFLO_CALLER_ID || "",
 };
