@@ -41,7 +41,7 @@ function getSyncType(val: string | undefined): "contact" | "broadcast" {
 }
 
 export const config: AppConfig = {
-  port: getEnvNumber("PORT", 5000),
+  port: getEnvNumber("PORT", 6000),
   nodeEnv: (process.env.NODE_ENV as "development" | "production" | "test") || "development",
   mongodbUri: process.env.MONGODB_URI || "0",
   jwtSecret: process.env.JWT_SECRET || "0",
