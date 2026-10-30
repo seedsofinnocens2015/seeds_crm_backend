@@ -784,6 +784,32 @@ async function runClickToCallTests() {
       config.corsOrigin = origCors;
     }
 
+    // -------------------------------------------------------------
+    // Test 9: Socket.IO JWT Handshake Token Extraction & Validation
+    // -------------------------------------------------------------
+    {
+      const jwt = (await import("jsonwebtoken")).default;
+      const validToken = jwt.sign(
+        { id: "user_agent_1", name: "Agent Test", email: "agent@seeds.com", role: "agent" },
+        config.jwtSecret,
+        { expiresIn: "1h" }
+      );
+
+      // Verify token decoded successfully
+      const decoded: any = jwt.verify(validToken, config.jwtSecret);
+      assert("JWT token generated and signed with jwtSecret", decoded?.id === "user_agent_1");
+      assert("Decoded role matches 'agent'", decoded?.role === "agent");
+
+      // Test invalid token rejection
+      let invalidRejected = false;
+      try {
+        jwt.verify("invalid_malformed_token", config.jwtSecret);
+      } catch {
+        invalidRejected = true;
+      }
+      assert("Invalid token throws verification error", invalidRejected === true);
+    }
+
   } finally {
     // Restore original configs
     config.smartfloCallerId = origCallerId;

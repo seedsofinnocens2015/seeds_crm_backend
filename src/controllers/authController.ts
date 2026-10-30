@@ -127,7 +127,10 @@ export async function getMe(req: Request, res: Response) {
       });
     }
 
-    return res.status(200).json({ user });
+    return res.status(200).json({
+      user,
+      token,
+    });
   } catch (error: any) {
     return res.status(401).json({ user: null });
   }

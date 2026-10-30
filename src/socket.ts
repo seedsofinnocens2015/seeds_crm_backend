@@ -57,21 +57,26 @@ export function initSocketServer(server: HttpServer): SocketIOServer {
       let token: string | undefined;
 
       // 1. From auth payload { token: "..." }
-      if (socket.handshake.auth && typeof socket.handshake.auth.token === "string") {
-        token = socket.handshake.auth.token;
+      if (socket.handshake.auth && typeof socket.handshake.auth.token === "string" && socket.handshake.auth.token.trim()) {
+        token = socket.handshake.auth.token.trim();
       }
 
-      // 2. From Authorization header
+      // 2. From handshake query parameter ?token=...
+      if (!token && socket.handshake.query && typeof socket.handshake.query.token === "string" && socket.handshake.query.token.trim()) {
+        token = socket.handshake.query.token.trim();
+      }
+
+      // 3. From Authorization header
       if (!token && socket.handshake.headers.authorization?.startsWith("Bearer ")) {
-        token = socket.handshake.headers.authorization.split(" ")[1];
+        token = socket.handshake.headers.authorization.split(" ")[1]?.trim();
       }
 
-      // 3. From cookie string
+      // 4. From cookie string
       if (!token && socket.handshake.headers.cookie) {
         const cookies = socket.handshake.headers.cookie.split(";").map((c) => c.trim());
         const tokenCookie = cookies.find((c) => c.startsWith("token="));
         if (tokenCookie) {
-          token = tokenCookie.substring("token=".length);
+          token = tokenCookie.substring("token=".length).trim();
         }
       }
 
