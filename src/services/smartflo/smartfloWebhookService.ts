@@ -348,26 +348,58 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
 
   // Step 2: Upsert SmartfloCallLog with Idempotency Key (callId)
+  const existingRecord = await SmartfloCallLog.findOne({ callId });
+  const isDuplicate = !!existingRecord;
+
+  // Status priority hierarchy to prevent terminal status regression from out-of-order webhooks
+  const statusWeight: Record<string, number> = {
+    unknown: 0,
+    in_progress: 10,
+    ringing: 10,
+    answered: 20,
+    connected: 20,
+    no_answer: 30,
+    missed: 30,
+    busy: 30,
+    failed: 30,
+  };
+
+  const currentWeight = statusWeight[existingRecord?.status || "unknown"] || 0;
+  const incomingWeight = statusWeight[status] || 0;
+
+  // Never overwrite an already answered, missed, or completed status with a weaker/earlier status (e.g. late in_progress)
+  const finalStatus = existingRecord && currentWeight >= 20 && incomingWeight < currentWeight
+    ? existingRecord.status
+    : status;
+
+  // Preserve recording URL and answered durations if already recorded and incoming is empty
+  const finalRecordingUrl = recordingUrl || existingRecord?.recordingUrl || "";
+  const finalHasRecording = hasRecording || !!existingRecord?.recordingAvailable;
+  const finalAnsweredDuration = answeredDuration > 0 ? answeredDuration : (existingRecord?.answeredDurationSeconds || 0);
+  const finalTotalDuration = totalDuration > 0 ? totalDuration : (existingRecord?.durationSeconds || 0);
+  const finalAgentName = agentName || existingRecord?.agentName || "";
+  const finalAgentNumber = agentNumber || existingRecord?.agentNumber || "";
+
   const updateData: Partial<ISmartfloCallLog> = {
     callId,
-    uuid: String(payload.uuid || ""),
-    refId: String(payload.ref_id || payload.refId || ""),
+    uuid: String(payload.uuid || existingRecord?.uuid || ""),
+    refId: String(payload.ref_id || payload.refId || existingRecord?.refId || ""),
     customerNumber,
     normalizedCustomerPhone: normalizedPhone,
-    agentName,
-    agentNumber,
+    agentName: finalAgentName,
+    agentNumber: finalAgentNumber,
     direction,
-    status,
-    durationSeconds: totalDuration,
-    answeredDurationSeconds: answeredDuration,
-    startTime: startTime ?? undefined,
-    endTime: endTime ?? undefined,
-    recordingUrl,
-    recordingAvailable: hasRecording,
-    disposition: String(payload.disposition || ""),
-    hangupCause: String(payload.hangup_cause_description || ""),
+    status: finalStatus,
+    durationSeconds: finalTotalDuration,
+    answeredDurationSeconds: finalAnsweredDuration,
+    startTime: startTime ?? existingRecord?.startTime ?? undefined,
+    endTime: endTime ?? existingRecord?.endTime ?? undefined,
+    recordingUrl: finalRecordingUrl,
+    recordingAvailable: finalHasRecording,
+    disposition: String(payload.disposition || existingRecord?.disposition || ""),
+    hangupCause: String(payload.hangup_cause_description || existingRecord?.hangupCause || ""),
     rawPayload: payload,
-    receivedAt: new Date(),
+    receivedAt: existingRecord?.receivedAt || new Date(),
   };
 
   if (matchedLead) {
@@ -385,9 +417,6 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     await SmartfloCallLog.deleteOne({ _id: existingByRef._id });
   }
 
-  const existingRecord = await SmartfloCallLog.findOne({ callId });
-  const isDuplicate = !!existingRecord;
-
   const savedCallLog = await SmartfloCallLog.findOneAndUpdate(
     { callId },
     { $set: updateData },
@@ -395,10 +424,11 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   );
 
   // Step 3: Record Call Activity into the Lead's Audit Log / History
-  if (matchedLead && !isDuplicate) {
-    const formattedDuration = answeredDuration > 0
-      ? `${Math.floor(answeredDuration / 60)}m ${answeredDuration % 60}s (Answered)`
-      : `${totalDuration}s`;
+  // Maintains exactly ONE auditLog entry per callId, updating it across lifecycle events (ringing -> answered -> hangup)
+  if (matchedLead) {
+    const formattedDuration = finalAnsweredDuration > 0
+      ? `${Math.floor(finalAnsweredDuration / 60)}m ${finalAnsweredDuration % 60}s (Answered)`
+      : `${finalTotalDuration}s`;
 
     const agentLabel = updateData.agentName || "Smartflo Dialer";
     const directionLabel = updateData.direction ? updateData.direction.toUpperCase() : "CALL";
@@ -408,9 +438,10 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     const detailParts = [
       `Duration: ${formattedDuration}`,
       `Call ID: ${callId}`,
-      hasRecording ? "Recording Available" : "No Recording",
+      finalHasRecording ? "Recording Available" : "No Recording",
     ];
     if (updateData.disposition) detailParts.push(`Disposition: ${updateData.disposition}`);
+    if (updateData.hangupCause) detailParts.push(`Cause: ${updateData.hangupCause}`);
 
     const callAuditEntry = {
       performedBy: agentLabel,
@@ -427,9 +458,31 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       ],
     };
 
-    await Lead.findByIdAndUpdate(matchedLead._id, {
-      $push: { auditLogs: callAuditEntry },
-    });
+    // Check if an auditLog for this callId already exists on the lead
+    const leadQuery = Lead.findById(matchedLead._id);
+    const currentLead = typeof leadQuery?.select === "function"
+      ? await leadQuery.select({ auditLogs: 1 })
+      : await leadQuery;
+
+    const existingLogIndex = (currentLead?.auditLogs || []).findIndex(
+      (log: any) => (log.changes || []).some((c: any) => c.field === "smartflo_call" && c.oldValue === callId)
+    );
+
+    if (existingLogIndex >= 0) {
+      // Update existing auditLog in-place without adding duplicate entries
+      const setPath = `auditLogs.${existingLogIndex}`;
+      await Lead.findByIdAndUpdate(matchedLead._id, {
+        $set: {
+          [`${setPath}.performedBy`]: agentLabel,
+          [`${setPath}.changes.0.newValue`]: `${title} | ${detailParts.join(" | ")}`,
+        },
+      });
+    } else {
+      // First event for this callId: push new activity entry
+      await Lead.findByIdAndUpdate(matchedLead._id, {
+        $push: { auditLogs: callAuditEntry },
+      });
+    }
   }
 
   // Step 4: Real-Time Inbound Call Popups for CRM

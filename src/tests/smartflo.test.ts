@@ -300,8 +300,16 @@ async function runTests() {
         },
       ],
     });
+    let existingAuditLogs: any[] = [];
+    (Lead as any).findById = () => ({
+      select: () => ({ auditLogs: existingAuditLogs }),
+    });
+
     (Lead as any).findByIdAndUpdate = async (id: any, update: any) => {
-      leadAuditPushes.push({ id, update });
+      if (update.$push?.auditLogs) {
+        leadAuditPushes.push({ id, update });
+        existingAuditLogs.push(update.$push.auditLogs);
+      }
       return {};
     };
 

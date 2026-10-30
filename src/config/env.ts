@@ -40,6 +40,14 @@ function getSyncType(val: string | undefined): "contact" | "broadcast" {
   return clean === "broadcast" ? "broadcast" : "contact";
 }
 
+function getBoolean(val: string | undefined, defaultValue: boolean): boolean {
+  if (val === undefined || val === null) return defaultValue;
+  const clean = String(val).trim().toLowerCase();
+  if (clean === "true" || clean === "1" || clean === "yes" || clean === "on") return true;
+  if (clean === "false" || clean === "0" || clean === "no" || clean === "off") return false;
+  return defaultValue;
+}
+
 export const config: AppConfig = {
   port: getEnvNumber("PORT", 6000),
   nodeEnv: (process.env.NODE_ENV as "development" | "production" | "test") || "development",
@@ -67,7 +75,7 @@ export const config: AppConfig = {
     process.env.SMARTFLO_LEAD_LIST_ID ||
     process.env.SMARTFLO_CONTACT_GROUP_ID ||
     "",
-  smartfloSyncEnabled: process.env.SMARTFLO_SYNC_ENABLED === "0",
+  smartfloSyncEnabled: getBoolean(process.env.SMARTFLO_SYNC_ENABLED, false),
   smartfloWebhookSecret: process.env.SMARTFLO_WEBHOOK_SECRET || "",
   smartfloApiKey: process.env.SMARTFLO_API_KEY || "",
   smartfloCallerId: process.env.SMARTFLO_CALLER_ID || "",

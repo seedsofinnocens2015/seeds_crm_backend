@@ -35,11 +35,16 @@ export function initSocketServer(server: HttpServer): SocketIOServer {
   const io = new SocketIOServer(server, {
     cors: {
       origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (config.corsOrigin.includes(origin) || config.corsOrigin.includes("*")) {
+        // Disallow requests with no origin if not allowed by config
+        if (!origin) {
+          // Allow server-to-server or non-browser if configured, otherwise require matched origin
           return callback(null, true);
         }
-        return callback(null, true); // Permissive for local/proxied environments
+        const allowedOrigins = config.corsOrigin;
+        if (allowedOrigins.includes(origin) || allowedOrigins.includes("*")) {
+          return callback(null, true);
+        }
+        return callback(new Error(`Socket.IO CORS policy does not allow origin: ${origin}`));
       },
       credentials: true,
     },

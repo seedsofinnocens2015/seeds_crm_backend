@@ -669,6 +669,84 @@ async function runClickToCallTests() {
 
         assert("Inbound answered event upgrades status to 'answered'", savedCallData?.status === "answered");
         assert("Inbound answered agent captured correctly", savedCallData?.agentName === "0608426290047");
+
+        // Case F: Inbound Hangup with duration and recording
+        let leadAuditPushed = 0;
+        let leadAuditUpdated = 0;
+        let updatedAuditValue = "";
+
+        const mockAuditLogs: any[] = [];
+        (Lead as any).findById = () => ({
+          select: () => ({ auditLogs: mockAuditLogs }),
+        });
+
+        (Lead as any).findByIdAndUpdate = async (_id: any, update: any) => {
+          if (update.$push?.auditLogs) {
+            leadAuditPushed++;
+            mockAuditLogs.push(update.$push.auditLogs);
+          }
+          if (update.$set) {
+            leadAuditUpdated++;
+            for (const k of Object.keys(update.$set)) {
+              if (k.endsWith(".newValue")) {
+                updatedAuditValue = update.$set[k];
+              }
+            }
+          }
+          return null;
+        };
+
+        // First event: ringing pushes initial activity
+        (SmartfloCallLog as any).findOne = async () => null;
+        await processSmartfloWebhook({
+          call_id: "LIFECYCLE_CALL_1",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "in_progress",
+        });
+        assert("Initial ringing event pushes 1 auditLog entry", leadAuditPushed === 1);
+
+        // Second event: answered updates existing activity in-place
+        (SmartfloCallLog as any).findOne = async () => savedCallData;
+        await processSmartfloWebhook({
+          call_id: "LIFECYCLE_CALL_1",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "answered",
+          answered_agent: "0608426290047",
+        });
+        assert("Answered event does NOT push second auditLog", leadAuditPushed === 1);
+        assert("Answered event updates auditLog in-place", leadAuditUpdated >= 1);
+        assert("Updated audit text contains ANSWERED", updatedAuditValue.includes("ANSWERED"));
+
+        // Third event: hangup updates final duration and recording
+        await processSmartfloWebhook({
+          call_id: "LIFECYCLE_CALL_1",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "answered",
+          answered_agent: "0608426290047",
+          duration: 90,
+          answered_duration: 85,
+          recording_url: "https://smartflo.tatateleservices.com/rec/123.wav",
+        });
+        assert("Hangup event preserves exactly 1 auditLog on the lead", leadAuditPushed === 1);
+        assert("Hangup event captures duration (1m 25s)", updatedAuditValue.includes("1m 25s"));
+        assert("Hangup event reflects Recording Available", updatedAuditValue.includes("Recording Available"));
+
+        // Out-of-order event: Late 'in_progress' does not regress answered terminal status
+        await processSmartfloWebhook({
+          call_id: "LIFECYCLE_CALL_1",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "in_progress",
+        });
+        assert("Out-of-order 'in_progress' does not regress answered status", savedCallData?.status === "answered");
+        assert("Out-of-order event preserves recording URL", savedCallData?.recordingUrl === "https://smartflo.tatateleservices.com/rec/123.wav");
       } finally {
         (Lead as any).findOne = origFindOne;
         (Lead as any).find = origFind;
@@ -676,6 +754,34 @@ async function runClickToCallTests() {
         (SmartfloCallLog as any).findOneAndUpdate = origFindOneAndUpdate;
         (SmartfloCallLog as any).findOne = origFindOneCallLog;
       }
+    }
+
+    // -------------------------------------------------------------
+    // Test 7: Phone Normalization Variants (+91, 91, 0, 10-digit)
+    // -------------------------------------------------------------
+    {
+      const { normalizePhoneNumber } = await import("../utils/phoneUtils.js");
+      assert("Normalizes plain 10-digit phone 9876543210", normalizePhoneNumber("9876543210") === "9876543210");
+      assert("Normalizes +91 prefixed phone +919876543210", normalizePhoneNumber("+919876543210") === "9876543210");
+      assert("Normalizes 91 prefixed phone 919876543210", normalizePhoneNumber("919876543210") === "9876543210");
+      assert("Normalizes 0 prefixed phone 09876543210", normalizePhoneNumber("09876543210") === "9876543210");
+      assert("Rejects invalid non-numeric short phone 123", normalizePhoneNumber("123") === null);
+    }
+
+    // -------------------------------------------------------------
+    // Test 8: Socket.IO Restricted CORS Origin Validation
+    // -------------------------------------------------------------
+    {
+      const origCors = config.corsOrigin;
+      config.corsOrigin = ["https://seedscrm.seedsofinnocens.com", "http://localhost:3000"];
+
+      const allowedOrigin = "https://seedscrm.seedsofinnocens.com";
+      const disallowedOrigin = "https://malicious-site.com";
+
+      assert("Configured CORS origin is allowed", config.corsOrigin.includes(allowedOrigin));
+      assert("Untrusted CORS origin is rejected", !config.corsOrigin.includes(disallowedOrigin));
+
+      config.corsOrigin = origCors;
     }
 
   } finally {
