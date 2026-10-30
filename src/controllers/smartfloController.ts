@@ -171,15 +171,31 @@ export async function getLeadCallHistory(req: Request, res: Response) {
       .sort({ receivedAt: -1, startTime: -1 })
       .lean();
 
+    // Helper to safely extract string agent name without [object Object]
+    const resolveAgentName = (agent: any): string => {
+      if (!agent) return "Agent";
+      if (typeof agent === "string") {
+        const trimmed = agent.trim();
+        return trimmed && trimmed !== "[object Object]" ? trimmed : "Agent";
+      }
+      if (typeof agent === "object") {
+        const nameCandidate = agent.agent_name || agent.name || agent.displayName || agent.email;
+        if (typeof nameCandidate === "string" && nameCandidate.trim()) {
+          return nameCandidate.trim();
+        }
+      }
+      return "Agent";
+    };
+
     // Map results safely, never exposing raw system tokens to the client
     const safeCalls = calls.map((c) => ({
       id: c._id,
       callId: c.callId,
       refId: c.refId || "",
-      direction: c.direction,
+      direction: c.direction && c.direction !== "unknown" ? c.direction : (c.refId ? "outbound" : "unknown"),
       status: c.status,
       customerNumber: c.customerNumber,
-      agentName: c.agentName || "Agent",
+      agentName: resolveAgentName(c.agentName),
       durationSeconds: c.durationSeconds,
       answeredDurationSeconds: c.answeredDurationSeconds,
       startTime: c.startTime,

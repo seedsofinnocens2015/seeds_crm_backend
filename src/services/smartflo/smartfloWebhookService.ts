@@ -92,15 +92,93 @@ function normalizeCallStatus(raw: string): "answered" | "missed" | "busy" | "fai
 
 /**
  * Normalizes call direction.
- * Returns "unknown" if direction is missing or unrecognized.
+ * Accurately parses standard direction keys, Smartflo-specific fields, call types, and numeric codes.
+ * Returns "unknown" only if direction cannot be determined.
  */
-function normalizeCallDirection(raw: string): "inbound" | "outbound" | "broadcast" | "unknown" {
-  const d = (raw || "").toLowerCase().trim();
-  if (!d) return "unknown";
-  if (d.includes("in")) return "inbound";
-  if (d.includes("broad")) return "broadcast";
-  if (d.includes("out")) return "outbound";
+function normalizeCallDirection(
+  rawDirection: any,
+  payload?: SmartfloWebhookPayload
+): "inbound" | "outbound" | "broadcast" | "unknown" {
+  // 1. Direct raw string/number check
+  if (rawDirection !== undefined && rawDirection !== null) {
+    const d = String(rawDirection).toLowerCase().trim();
+    if (d === "1" || d === "in" || d.includes("inbound")) return "inbound";
+    if (d === "2" || d === "out" || d.includes("outbound") || d === "click_to_call") return "outbound";
+    if (d.includes("broad")) return "broadcast";
+  }
+
+  // 2. Payload context inspection if direct direction is missing or ambiguous
+  if (payload) {
+    // Check call_type or callType
+    const callType = String(payload.call_type ?? payload.callType ?? payload.type ?? "").toLowerCase().trim();
+    if (callType === "1" || callType.includes("inbound")) return "inbound";
+    if (callType === "2" || callType.includes("outbound") || callType === "click_to_call") return "outbound";
+    if (callType.includes("broad")) return "broadcast";
+
+    // Check outbound_type (Smartflo Click-to-Call sends outbound_type: "click_to_call" or similar)
+    const outboundType = String(payload.outbound_type ?? payload.outboundType ?? "").toLowerCase().trim();
+    if (outboundType.includes("click") || outboundType.includes("outbound")) return "outbound";
+
+    // Check if initiated via custom_identifier or ref_id from Click-to-Call
+    if (payload.ref_id || payload.refId) return "outbound";
+    if (payload.custom_identifier && typeof payload.custom_identifier === "object") {
+      if (Object.keys(payload.custom_identifier).length > 0) return "outbound";
+    }
+
+    // Check call_flow: if first node is an Agent or contains Click to Call, it's outbound
+    if (Array.isArray(payload.call_flow) && payload.call_flow.length > 0) {
+      const flowStr = JSON.stringify(payload.call_flow).toLowerCase();
+      if (flowStr.includes("click") || flowStr.includes("outbound")) return "outbound";
+    }
+  }
+
   return "unknown";
+}
+
+/**
+ * Safely extracts a clean string display name for the agent.
+ * Handles strings, nested objects ({ name, agent_name }), and strips raw object stringifications.
+ */
+function extractAgentName(rawAgent: any, payload?: SmartfloWebhookPayload): string {
+  // If rawAgent is an object
+  if (rawAgent && typeof rawAgent === "object") {
+    const candidate = rawAgent.agent_name || rawAgent.name || rawAgent.displayName || rawAgent.agentName;
+    if (candidate && typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  // If rawAgent is string
+  if (typeof rawAgent === "string" && rawAgent.trim() && rawAgent.trim() !== "[object Object]") {
+    return rawAgent.trim();
+  }
+
+  // Check payload fallbacks
+  if (payload) {
+    if (payload.answer_agent_name && typeof payload.answer_agent_name === "string" && payload.answer_agent_name.trim()) {
+      return payload.answer_agent_name.trim();
+    }
+    if (Array.isArray(payload.agents_answered_details) && payload.agents_answered_details.length > 0) {
+      const firstAgent = payload.agents_answered_details[0];
+      if (firstAgent && typeof firstAgent === "object") {
+        const candidate = firstAgent.agent_name || firstAgent.name;
+        if (candidate && typeof candidate === "string" && candidate.trim()) {
+          return candidate.trim();
+        }
+      }
+    }
+    if (payload.agent_name && typeof payload.agent_name === "string" && payload.agent_name.trim() && payload.agent_name.trim() !== "[object Object]") {
+      return payload.agent_name.trim();
+    }
+    if (payload.answered_agent && typeof payload.answered_agent === "string" && payload.answered_agent.trim() && payload.answered_agent.trim() !== "[object Object]") {
+      return payload.answered_agent.trim();
+    }
+    if (payload.agent_id && typeof payload.agent_id === "string" && payload.agent_id.trim() && payload.agent_id.trim() !== "[object Object]") {
+      return payload.agent_id.trim();
+    }
+  }
+
+  return "";
 }
 
 /**
@@ -149,8 +227,8 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const callId = String(rawCallId).trim();
 
   // 2. Direction normalization
-  const rawDirection = payload.Direction ?? payload.direction ?? "";
-  const direction = normalizeCallDirection(String(rawDirection));
+  const rawDirection = payload.Direction ?? payload.direction ?? payload.call_type ?? payload.callType ?? payload.type ?? "";
+  const direction = normalizeCallDirection(rawDirection, payload);
 
   // 3. Customer phone extraction based on direction
   // - Inbound: SourceNumber is the calling customer; DestinationNumber is company DID.
@@ -206,8 +284,8 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const recordingUrl = typeof rawRecordingUrl === "string" ? rawRecordingUrl.trim() : "";
   const hasRecording = recordingUrl.length > 0;
 
-  // 8. Agent and Display Number
-  const agentName = String(payload.answered_agent ?? payload.agent_name ?? payload.agent_id ?? "").trim();
+  // 8. Agent and Display Number (sanitize to string, never allow [object Object])
+  const agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
   const agentNumber = String(payload.answered_agent_number ?? "").trim();
 
   // 9. External CRM identifier passed back by dialer (custom parameter, custom_identifier, or explicit CRM id)

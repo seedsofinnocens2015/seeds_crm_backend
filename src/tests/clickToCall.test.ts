@@ -1,9 +1,12 @@
 import { initiateSmartfloClickToCall, _clearClickToCallDebounceMap } from "../services/smartflo/smartfloClickToCallService.js";
-import { handleClickToCall } from "../controllers/smartfloController.js";
+import { handleClickToCall, handleHangupCall } from "../controllers/smartfloController.js";
+import { processSmartfloWebhook } from "../services/smartflo/smartfloWebhookService.js";
 import { config } from "../config/env.js";
 import { _setMockTokenCache, invalidateSmartfloAccessToken } from "../services/smartflo/smartfloAuthService.js";
 import { Lead } from "../models/Lead.js";
 import { User } from "../models/User.js";
+import { SmartfloCallLog } from "../models/SmartfloCallLog.js";
+import mongoose from "mongoose";
 
 async function runClickToCallTests() {
   console.log("=== Running Smartflo Click-to-Call Unit & Logic Tests ===");
@@ -566,6 +569,76 @@ async function runClickToCallTests() {
       assert("403 error explains hangup access restriction", jsonReceived?.error?.includes("Access denied"));
 
       Lead.findOne = origLeadFindOne;
+    }
+
+    // -------------------------------------------------------------
+    // Test 6: Webhook direction normalization & agent display extraction
+    // -------------------------------------------------------------
+    {
+      const origFindOne = Lead.findOne;
+      const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
+      const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
+      const origFindOneCallLog = SmartfloCallLog.findOne;
+
+      try {
+        let savedCallData: any = null;
+
+        (Lead as any).findOne = async () => ({
+          _id: new mongoose.Types.ObjectId(),
+          uniqueId: "SOI-999",
+        });
+        (Lead as any).findByIdAndUpdate = async () => null;
+
+        (SmartfloCallLog as any).findOne = async () => null;
+        (SmartfloCallLog as any).findOneAndUpdate = async (_query: any, update: any) => {
+          savedCallData = update.$set;
+          return { _id: new mongoose.Types.ObjectId(), ...update.$set };
+        };
+
+        // Case A: Smartflo sends call_type: "outbound" without "direction" key
+        await processSmartfloWebhook({
+          call_id: "CALL_TYPE_TEST_1",
+          call_type: "outbound",
+          DestinationNumber: "9876543210",
+          agent_name: "Amit Kumar",
+          CallDuration: 45,
+          custom_identifier: { lead_unique_id: "SOI-999" },
+        });
+
+        assert("Payload with call_type 'outbound' normalizes direction to 'outbound'", savedCallData?.direction === "outbound");
+        assert("Agent name 'Amit Kumar' extracted cleanly", savedCallData?.agentName === "Amit Kumar");
+
+        // Case B: Smartflo sends raw agent as object or stringified object
+        await processSmartfloWebhook({
+          call_id: "CALL_AGENT_OBJ_TEST",
+          direction: "inbound",
+          SourceNumber: "9876543210",
+          agent_name: "[object Object]",
+          answer_agent_name: "Amit Kumar",
+          CallDuration: 20,
+          custom_identifier: { lead_unique_id: "SOI-999" },
+        });
+
+        assert("Fallback to answer_agent_name when agent_name is [object Object]", savedCallData?.agentName === "Amit Kumar");
+
+        // Case C: Click-to-call payload with outbound_type: "click_to_call"
+        await processSmartfloWebhook({
+          call_id: "C2C_OUTBOUND_TEST",
+          outbound_type: "click_to_call",
+          DestinationNumber: "9876543210",
+          answered_agent: { name: "Amit Kumar" } as any,
+          CallDuration: 30,
+          custom_identifier: { lead_unique_id: "SOI-999" },
+        });
+
+        assert("Payload with outbound_type 'click_to_call' normalizes direction to 'outbound'", savedCallData?.direction === "outbound");
+        assert("Agent object extracted to string name 'Amit Kumar'", savedCallData?.agentName === "Amit Kumar");
+      } finally {
+        (Lead as any).findOne = origFindOne;
+        (Lead as any).findByIdAndUpdate = origFindByIdAndUpdate;
+        (SmartfloCallLog as any).findOneAndUpdate = origFindOneAndUpdate;
+        (SmartfloCallLog as any).findOne = origFindOneCallLog;
+      }
     }
 
   } finally {
