@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import { Lead, ILead } from "../../models/Lead.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
+import { broadcastInboundCallEvent, InboundCallNotification } from "../../socket.js";
 
 export interface SmartfloWebhookPayload {
   // Call ID aliases
@@ -429,6 +430,47 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     await Lead.findByIdAndUpdate(matchedLead._id, {
       $push: { auditLogs: callAuditEntry },
     });
+  }
+
+  // Step 4: Real-Time Inbound Call Popups for CRM
+  if (direction === "inbound") {
+    const calledDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? "");
+    const leadDisplayName = matchedLead
+      ? (matchedLead.wifeName || matchedLead.husbandName || matchedLead.patientName || "Valued Lead")
+      : "Unknown Caller";
+
+    const notificationPayload: InboundCallNotification = {
+      callId,
+      uuid: String(payload.uuid || ""),
+      did: calledDid,
+      callerNumber: customerNumber,
+      normalizedPhone,
+      status: status === "answered" ? "answered" : status === "missed" ? "missed" : status === "in_progress" ? "ringing" : "ended",
+      timestamp: (startTime || new Date()).toISOString(),
+      agentExtension: agentNumber || undefined,
+      agentName: agentName || undefined,
+      leadMatched: !!matchedLead,
+      lead: matchedLead
+        ? {
+            id: matchedLead._id.toString(),
+            uniqueId: matchedLead.uniqueId,
+            name: leadDisplayName,
+            stage: matchedLead.leadStage || "Fresh Lead",
+            owner: matchedLead.leadOwner || matchedLead.callerName || undefined,
+            primaryMobileNumber: matchedLead.primaryMobileNumber || customerNumber,
+          }
+        : null,
+    };
+
+    if (status === "in_progress") {
+      broadcastInboundCallEvent("inbound:ringing", notificationPayload);
+    } else if (status === "answered") {
+      broadcastInboundCallEvent("inbound:answered", notificationPayload);
+    } else if (status === "missed") {
+      broadcastInboundCallEvent("inbound:missed", notificationPayload);
+    } else {
+      broadcastInboundCallEvent("inbound:ended", notificationPayload);
+    }
   }
 
   return {

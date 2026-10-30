@@ -576,6 +576,7 @@ async function runClickToCallTests() {
     // -------------------------------------------------------------
     {
       const origFindOne = Lead.findOne;
+      const origFind = Lead.find;
       const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
       const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
       const origFindOneCallLog = SmartfloCallLog.findOne;
@@ -586,6 +587,14 @@ async function runClickToCallTests() {
         (Lead as any).findOne = async () => ({
           _id: new mongoose.Types.ObjectId(),
           uniqueId: "SOI-999",
+        });
+        (Lead as any).find = () => ({
+          limit: () => [{
+            _id: new mongoose.Types.ObjectId(),
+            uniqueId: "SOI-999",
+            normalizedPhone: "919876543210",
+            primaryMobileNumber: "9876543210",
+          }],
         });
         (Lead as any).findByIdAndUpdate = async () => null;
 
@@ -633,8 +642,36 @@ async function runClickToCallTests() {
 
         assert("Payload with outbound_type 'click_to_call' normalizes direction to 'outbound'", savedCallData?.direction === "outbound");
         assert("Agent object extracted to string name 'Amit Kumar'", savedCallData?.agentName === "Amit Kumar");
+
+        // Case D: Inbound Ringing (Call Received On Server)
+        await processSmartfloWebhook({
+          call_id: "INBOUND_RING_101",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "in_progress",
+        });
+
+        assert("Inbound ringing event sets direction to 'inbound'", savedCallData?.direction === "inbound");
+        assert("Inbound ringing event normalizes customer number", savedCallData?.customerNumber === "919876543210");
+        assert("Inbound ringing status normalized to 'in_progress'", savedCallData?.status === "in_progress");
+        assert("Inbound call associates matched lead", savedCallData?.crmLeadUniqueId === "SOI-999");
+
+        // Case E: Inbound Answered by Agent
+        await processSmartfloWebhook({
+          call_id: "INBOUND_RING_101",
+          direction: "inbound",
+          SourceNumber: "919876543210",
+          call_to_number: "919228173971",
+          status: "answered",
+          answered_agent: "0608426290047",
+        });
+
+        assert("Inbound answered event upgrades status to 'answered'", savedCallData?.status === "answered");
+        assert("Inbound answered agent captured correctly", savedCallData?.agentName === "0608426290047");
       } finally {
         (Lead as any).findOne = origFindOne;
+        (Lead as any).find = origFind;
         (Lead as any).findByIdAndUpdate = origFindByIdAndUpdate;
         (SmartfloCallLog as any).findOneAndUpdate = origFindOneAndUpdate;
         (SmartfloCallLog as any).findOne = origFindOneCallLog;

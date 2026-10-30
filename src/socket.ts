@@ -1,0 +1,120 @@
+import { Server as HttpServer } from "http";
+import { Server as SocketIOServer, Socket } from "socket.io";
+import jwt from "jsonwebtoken";
+import { config } from "./config/env.js";
+import { AuthenticatedUserPayload } from "./middleware/auth.js";
+
+let ioInstance: SocketIOServer | null = null;
+
+export interface InboundCallNotification {
+  callId: string;
+  uuid?: string;
+  did: string;
+  callerNumber: string;
+  normalizedPhone: string;
+  status: "ringing" | "answered" | "missed" | "ended";
+  timestamp: string;
+  agentExtension?: string;
+  agentName?: string;
+  leadMatched: boolean;
+  lead?: {
+    id: string;
+    uniqueId: string;
+    name: string;
+    stage?: string;
+    owner?: string;
+    primaryMobileNumber?: string;
+    gender?: string;
+  } | null;
+}
+
+/**
+ * Initializes authenticated Socket.IO server mounted on the HTTP server.
+ */
+export function initSocketServer(server: HttpServer): SocketIOServer {
+  const io = new SocketIOServer(server, {
+    cors: {
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        if (config.corsOrigin.includes(origin) || config.corsOrigin.includes("*")) {
+          return callback(null, true);
+        }
+        return callback(null, true); // Permissive for local/proxied environments
+      },
+      credentials: true,
+    },
+    path: "/socket.io",
+  });
+
+  // Authentication Middleware: inspects cookie or auth token in handshake
+  io.use((socket: Socket, next) => {
+    try {
+      let token: string | undefined;
+
+      // 1. From auth payload { token: "..." }
+      if (socket.handshake.auth && typeof socket.handshake.auth.token === "string") {
+        token = socket.handshake.auth.token;
+      }
+
+      // 2. From Authorization header
+      if (!token && socket.handshake.headers.authorization?.startsWith("Bearer ")) {
+        token = socket.handshake.headers.authorization.split(" ")[1];
+      }
+
+      // 3. From cookie string
+      if (!token && socket.handshake.headers.cookie) {
+        const cookies = socket.handshake.headers.cookie.split(";").map((c) => c.trim());
+        const tokenCookie = cookies.find((c) => c.startsWith("token="));
+        if (tokenCookie) {
+          token = tokenCookie.substring("token=".length);
+        }
+      }
+
+      if (!token) {
+        return next(new Error("Authentication token required for WebSocket connection."));
+      }
+
+      const decoded = jwt.verify(token, config.jwtSecret) as AuthenticatedUserPayload;
+      (socket as any).user = decoded;
+      next();
+    } catch (err: any) {
+      return next(new Error("Invalid or expired authentication token."));
+    }
+  });
+
+  io.on("connection", (socket: Socket) => {
+    const user: AuthenticatedUserPayload = (socket as any).user;
+    if (!user) return;
+
+    // Join user-specific room
+    socket.join(`user:${user.id}`);
+    socket.join(`role:${user.role}`);
+
+    // Common room for all agents and managers handling inbound telephony
+    socket.join("telephony:inbound");
+
+    socket.on("disconnect", () => {
+      // Clean disconnect
+    });
+  });
+
+  ioInstance = io;
+  return io;
+}
+
+/**
+ * Returns active Socket.IO server instance.
+ */
+export function getSocketServer(): SocketIOServer | null {
+  return ioInstance;
+}
+
+/**
+ * Broadcasts an incoming or active call event to authenticated telephony agents.
+ */
+export function broadcastInboundCallEvent(event: "inbound:ringing" | "inbound:answered" | "inbound:ended" | "inbound:missed", data: InboundCallNotification) {
+  if (!ioInstance) return;
+
+  // Broadcast to all active telephony agents & managers
+  ioInstance.to("telephony:inbound").emit(event, data);
+}

@@ -3,8 +3,12 @@ import app from "./app.js";
 import { config } from "./config/env.js";
 import { connectDB, disconnectDB } from "./config/db.js";
 import { startSmartfloScheduler, stopSmartfloScheduler } from "./services/smartflo/smartfloScheduler.js";
+import { initSocketServer } from "./socket.js";
 
 const server = http.createServer(app);
+
+// Mount authenticated Socket.IO instance for real-time CRM telephony notifications
+initSocketServer(server);
 
 async function startServer() {
   // Connect to database before accepting incoming requests
