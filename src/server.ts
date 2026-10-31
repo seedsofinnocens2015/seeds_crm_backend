@@ -19,8 +19,8 @@ async function startServer() {
   }
 
   server.listen(config.port, () => {
-    console.log(`[Server] seeds-crm-backend running on port ${config.port} in ${config.nodeEnv} mode`);
-    console.log(`[Server] Health check available at: http://localhost:${config.port}/health`);
+    console.log(`[Server] seeds-crm-backend running`);
+    // console.log(`[Server] Health check available at: http://localhost:${config.port}/health`);
 
     // Register Smartflo queue and CDR scheduler if feature flag is active
     startSmartfloScheduler();
