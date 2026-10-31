@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import { Lead, ILead } from "../../models/Lead.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
-import { broadcastInboundCallEvent, InboundCallNotification } from "../../socket.js";
+import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
 
 export interface SmartfloWebhookPayload {
   // Call ID aliases
@@ -536,7 +536,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     }
   }
 
-  // Step 4: Real-Time Inbound Call Popups for CRM
+  // Step 4: Real-Time Call Popups and Lifecycle Synchronization for CRM
   if (direction === "inbound") {
     const calledDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? "");
     const leadDisplayName = matchedLead
@@ -578,6 +578,29 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     } else {
       console.info(`[Smartflo Webhook] Emitting inbound:ended for callId=${callId}, leadMatched=${!!matchedLead}`);
       broadcastInboundCallEvent("inbound:ended", notificationPayload);
+    }
+  } else {
+    // Outbound Call Lifecycle Synchronization:
+    // When customer disconnects or call finishes (answered/completed/missed/failed),
+    // broadcast terminal events to clear active call states across CRM clients.
+    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status);
+    if (isTerminal) {
+      const callEndedPayload: CallEndedNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined),
+        leadUniqueId: matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined),
+        customerNumber,
+        status: status === "answered" ? "answered" : status === "missed" ? "missed" : "ended",
+        durationSeconds: finalTotalDuration,
+        timestamp: (endTime || new Date()).toISOString(),
+      };
+
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}`
+      );
+      broadcastCallEndedEvent("outbound:ended", callEndedPayload);
+      broadcastCallEndedEvent("call:ended", callEndedPayload);
     }
   }
 

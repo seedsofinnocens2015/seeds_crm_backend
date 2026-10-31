@@ -5,6 +5,7 @@ import { Lead } from "../models/Lead.js";
 import { User } from "../models/User.js";
 import { SmartfloLeadJob } from "../models/SmartfloLeadJob.js";
 import { SmartfloCallLog } from "../models/SmartfloCallLog.js";
+import { broadcastCallEndedEvent } from "../socket.js";
 import {
   processSmartfloWebhook,
   processSmartfloJob,
@@ -529,11 +530,39 @@ export async function handleHangupCall(req: Request, res: Response) {
       }
     }
 
-    // 3. Dispatch Call Hangup request via dedicated service
+    // 3. If only refId is provided, check if SmartfloCallLog has already recorded an official callId
+    let effectiveCallId = callId;
+    let effectiveRefId = refId;
+    if (!effectiveCallId && effectiveRefId) {
+      try {
+        const existingLog = await SmartfloCallLog.findOne({ refId: effectiveRefId });
+        if (existingLog && existingLog.callId && !existingLog.callId.startsWith("C2C_PENDING_")) {
+          effectiveCallId = existingLog.callId;
+        }
+      } catch (logLookupErr: any) {
+        // non-blocking fallback
+      }
+    }
+
+    // 4. Dispatch Call Hangup request via dedicated service
     const result = await executeSmartfloCallHangup({
-      refId,
-      callId,
+      refId: effectiveRefId,
+      callId: effectiveCallId,
     });
+
+    // 5. Emit real-time terminal event to clear active call states across CRM agents
+    try {
+      broadcastCallEndedEvent("outbound:ended", {
+        callId: effectiveCallId,
+        refId: effectiveRefId,
+        leadId: lead._id?.toString(),
+        leadUniqueId: lead.uniqueId,
+        status: "ended",
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      // non-blocking
+    }
 
     return res.status(200).json({
       status: "success",

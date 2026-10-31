@@ -26,7 +26,7 @@ const HANGUP_DEBOUNCE_WINDOW_MS = 5000; // 5 seconds debounce per call identifie
  */
 export async function executeSmartfloCallHangup(
   params: HangupCallParams,
-  fetchFn: typeof fetch = fetch,
+  fetchFn: typeof fetch = (globalThis as any)._smartfloMockFetch || fetch,
   currentTimeProvider: () => number = () => Date.now()
 ): Promise<HangupCallResult> {
   const cleanRefId = (params.refId || "").trim();
@@ -86,6 +86,28 @@ export async function executeSmartfloCallHangup(
 
   if (!response.ok) {
     const errorText = await response.text();
+    // Tata Smartflo returns HTTP 422 {"success":false,"message":"Invalid Ref ID"}
+    // or "Call is not active" if the call was already hung up (e.g. by customer or remote switch).
+    // In telephony lifecycle synchronization, this is a normal terminal state, NOT a fatal system failure.
+    if (
+      response.status === 422 ||
+      errorText.includes("Invalid Ref ID") ||
+      errorText.includes("Call is not active") ||
+      errorText.includes("not found") ||
+      errorText.includes("already hungup")
+    ) {
+      console.warn(
+        `[Smartflo Hangup] Received HTTP ${response.status} for ${identifierType}=${identifierValue}: Call is already terminated on telephony switch.`
+      );
+      recentHangupsMap.set(identifierValue, now);
+      return {
+        success: true,
+        message: "Call has already ended.",
+        identifierType,
+        identifierValue,
+      };
+    }
+
     throw new Error(`Smartflo Call Hangup error (HTTP ${response.status}): ${errorText.slice(0, 200)}`);
   }
 
@@ -96,7 +118,21 @@ export async function executeSmartfloCallHangup(
   };
 
   if (resJson.success === false) {
-    throw new Error(resJson.message || "Smartflo rejected call hangup request.");
+    const msg = resJson.message || "";
+    if (
+      msg.includes("Invalid Ref ID") ||
+      msg.includes("Call is not active") ||
+      msg.includes("already hungup")
+    ) {
+      recentHangupsMap.set(identifierValue, now);
+      return {
+        success: true,
+        message: "Call has already ended.",
+        identifierType,
+        identifierValue,
+      };
+    }
+    throw new Error(msg || "Smartflo rejected call hangup request.");
   }
 
   // Register in debounce cache upon successful acceptance

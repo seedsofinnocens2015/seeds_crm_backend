@@ -1,4 +1,5 @@
 import { initiateSmartfloClickToCall, _clearClickToCallDebounceMap } from "../services/smartflo/smartfloClickToCallService.js";
+import { executeSmartfloCallHangup, _clearHangupDebounceMap } from "../services/smartflo/smartfloHangupService.js";
 import { handleClickToCall, handleHangupCall } from "../controllers/smartfloController.js";
 import { processSmartfloWebhook } from "../services/smartflo/smartfloWebhookService.js";
 import { config } from "../config/env.js";
@@ -513,7 +514,7 @@ async function runClickToCallTests() {
       const mockHangupReject: any = async () => ({
         ok: false,
         status: 400,
-        text: async () => JSON.stringify({ success: false, message: "Call has already ended." }),
+        text: async () => JSON.stringify({ success: false, message: "Invalid parameters provided" }),
       });
 
       let threwReject = false;
@@ -972,6 +973,129 @@ async function runClickToCallTests() {
         "Missing extension blocks call with exact instruction message",
         missingExtensionErrorMsg === "Please add your Smartflo Extension ID in Profile Settings."
       );
+    }
+
+    // -------------------------------------------------------------
+    // Test 11: Call Lifecycle Synchronization & HTTP 422 Graceful Handling
+    // -------------------------------------------------------------
+    {
+      _clearHangupDebounceMap();
+
+      // 11A: Smartflo HTTP 422 "Invalid Ref ID" (call already hung up on carrier) handles gracefully
+      const mock422HangupFetch = (async (url: string, opts: any) => {
+        if (url.includes("/v1/auth/login")) {
+          return new Response(JSON.stringify({ success: true, access_token: "mock-token-xyz" }), { status: 200 });
+        }
+        if (url.includes("/call/hangup")) {
+          return new Response(JSON.stringify({ success: false, message: "Invalid Ref ID" }), {
+            status: 422,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      }) as any;
+
+      const result422 = await executeSmartfloCallHangup({ refId: "REF_ALREADY_DEAD_1" }, mock422HangupFetch);
+      assert("HTTP 422 'Invalid Ref ID' resolves with success: true", result422.success === true);
+      assert("HTTP 422 returns user-friendly ended message", result422.message.includes("Call has already ended"));
+
+      // 11B: Controller handleHangupCall gracefully handles already ended call and returns HTTP 200
+      const origLeadFindOne = Lead.findOne;
+      (Lead as any).findOne = () => ({
+        then: (resolve: any) =>
+          resolve({
+            _id: "lead_hangup_id",
+            uniqueId: "SOI-5555",
+            callerName: "Agent Test",
+            leadOwner: "Agent Test",
+          }),
+      });
+
+      _clearHangupDebounceMap();
+      let ctrlStatus = 0;
+      let ctrlJson: any = null;
+      const mockRes: any = {
+        status: (code: number) => {
+          ctrlStatus = code;
+          return {
+            json: (payload: any) => {
+              ctrlJson = payload;
+            },
+          };
+        },
+      };
+
+      const mockReqHangup: any = {
+        user: { id: "agent_555", name: "Agent Test", role: "agent" },
+        body: { leadId: "SOI-5555", refId: "REF_DEAD_CTRL_1" },
+      };
+
+      (globalThis as any)._smartfloMockFetch = mock422HangupFetch;
+      await handleHangupCall(mockReqHangup, mockRes);
+      delete (globalThis as any)._smartfloMockFetch;
+
+      assert("Controller returns HTTP 200 on hangup request", ctrlStatus === 200);
+      assert("Controller status is success", ctrlJson?.status === "success");
+
+      Lead.findOne = origLeadFindOne;
+
+      // 11C: Outbound terminal webhook triggers outbound:ended broadcast
+      const origFindOne = Lead.findOne;
+      const origFind = Lead.find;
+      const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
+      const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
+      const origFindOneCallLog = SmartfloCallLog.findOne;
+
+      try {
+        let loggedCall: any = null;
+        (SmartfloCallLog as any).findOne = () => ({
+          then: (res: any) => res(null),
+        });
+        (SmartfloCallLog as any).findOneAndUpdate = (_query: any, update: any) => {
+          loggedCall = update.$set;
+          return {
+            _id: "call_log_c2c_ended",
+            ...update.$set,
+          };
+        };
+        (Lead as any).findOne = () => ({
+          then: (res: any) =>
+            res({
+              _id: "lead_outbound_term",
+              uniqueId: "SOI-8888",
+              wifeName: "Neha Sharma",
+              primaryMobileNumber: "9876543210",
+              auditLogs: [],
+            }),
+        });
+        (Lead as any).find = () => ({
+          limit: () => Promise.resolve([]),
+        });
+        (Lead as any).findByIdAndUpdate = () => Promise.resolve({});
+
+        const outboundTerminalWebhook = {
+          call_id: "C2C_TERMINAL_CALL_99",
+          ref_id: "REF_TERMINAL_99",
+          customer_number: "9876543210",
+          call_type: "outbound",
+          status: "answered",
+          total_call_duration: "45",
+          answered_call_duration: "30",
+          hangup_cause_description: "NORMAL_CLEARING",
+          custom_identifier: { lead_unique_id: "SOI-8888" },
+        };
+
+        const webhookRes = await processSmartfloWebhook(outboundTerminalWebhook);
+        assert("Outbound terminal webhook succeeds", webhookRes.success === true);
+        assert("Outbound terminal call log status is answered", loggedCall?.status === "answered");
+        assert("Outbound terminal call log direction is outbound", loggedCall?.direction === "outbound");
+      } finally {
+        Lead.findOne = origFindOne;
+        Lead.find = origFind;
+        Lead.findByIdAndUpdate = origFindByIdAndUpdate;
+        SmartfloCallLog.findOneAndUpdate = origFindOneAndUpdate;
+        SmartfloCallLog.findOne = origFindOneCallLog;
+      }
     }
 
   } finally {

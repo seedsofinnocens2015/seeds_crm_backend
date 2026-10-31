@@ -28,6 +28,17 @@ export interface InboundCallNotification {
   } | null;
 }
 
+export interface CallEndedNotification {
+  callId?: string;
+  refId?: string;
+  leadId?: string;
+  leadUniqueId?: string;
+  customerNumber?: string;
+  status: "answered" | "missed" | "ended" | "failed" | "completed";
+  durationSeconds?: number;
+  timestamp: string;
+}
+
 /**
  * Initializes authenticated Socket.IO server mounted on the HTTP server.
  */
@@ -127,4 +138,23 @@ export function broadcastInboundCallEvent(event: "inbound:ringing" | "inbound:an
 
   // Broadcast to all active telephony agents & managers
   ioInstance.to("telephony:inbound").emit(event, data);
+}
+
+/**
+ * Broadcasts an outbound or general call terminal event to authenticated telephony rooms.
+ */
+export function broadcastCallEndedEvent(
+  event: "outbound:ended" | "call:ended",
+  data: CallEndedNotification,
+  targetUserId?: string
+) {
+  if (!ioInstance) return;
+
+  // Always emit to general telephony room
+  ioInstance.to("telephony:inbound").emit(event, data);
+
+  // If agent/initiator userId is known, also emit directly to user's private room
+  if (targetUserId) {
+    ioInstance.to(`user:${targetUserId}`).emit(event, data);
+  }
 }
