@@ -224,22 +224,33 @@ function parseSafeDuration(val: any): number {
 }
 
 /**
- * Safely parses dates including ISO8601 and SQL format "YYYY-MM-DD HH:mm:ss".
+ * Safely parses dates including ISO8601, SQL format "YYYY-MM-DD HH:mm:ss", and timezone-naive strings.
+ * Smartflo portals are typically configured with Time Zone: "IST: Indian Standard Time".
+ * When timestamps arrive without an explicit UTC/offset specifier (e.g. '2026-10-31 13:09:00'),
+ * it treats them as Indian Standard Time (+05:30) so they convert accurately into UTC instants,
+ * preventing double timezone shift or false 5-hour offsets.
  * Returns undefined if input is empty, null, or invalid rather than replacing with new Date().
  */
 function parseSafeDate(raw: any): Date | undefined {
-  if (!raw || typeof raw !== "string") {
-    if (raw instanceof Date && !isNaN(raw.getTime())) return raw;
-    return undefined;
-  }
+  if (!raw) return undefined;
+  if (raw instanceof Date && !isNaN(raw.getTime())) return raw;
+  if (typeof raw !== "string") return undefined;
   const str = raw.trim();
   if (!str) return undefined;
 
-  // Handle SQL format "YYYY-MM-DD HH:mm:ss" by replacing space with 'T' if no timezone offset
+  // 1. If string explicitly specifies timezone (ends with Z or +/-HH:mm offset)
+  if (str.endsWith("Z") || str.endsWith("z") || /[+-]\d{2}(:\d{2})?$/.test(str)) {
+    const d = new Date(str);
+    return isNaN(d.getTime()) ? undefined : d;
+  }
+
+  // 2. Handle SQL format "YYYY-MM-DD HH:mm:ss" or naive ISO "YYYY-MM-DDTHH:mm:ss"
   const isoCandidate = str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str;
-  const d = new Date(isoCandidate);
-  if (!isNaN(d.getTime())) {
-    return d;
+
+  // Parse as IST (+05:30) by default because Smartflo account is configured in IST
+  const istDate = new Date(`${isoCandidate}+05:30`);
+  if (!isNaN(istDate.getTime())) {
+    return istDate;
   }
 
   // Fallback direct parse attempt
