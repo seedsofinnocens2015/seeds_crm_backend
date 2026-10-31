@@ -64,12 +64,12 @@ export async function initiateSmartfloClickToCall(
     throw new Error("Lead has recorded 'No' for calling consent. Calling blocked.");
   }
 
-  // 2. Resolve & Validate Agent Number
-  // Priority: user.smartfloAgentId -> user.smartfloAgentNumber -> user.mobile (if registered on Smartflo)
+  // 2. Resolve & Validate Agent Extension / Number
+  // Priority: user.smartfloAgentId -> user.smartfloAgentNumber
   const resolvedAgent = (user.smartfloAgentId || user.smartfloAgentNumber || "").trim();
   if (!resolvedAgent) {
     throw new Error(
-      "Please add your Smartflo Extension ID in Profile Settings."
+      "Please configure your Smartflo Extension ID in Profile Settings before initiating calls."
     );
   }
 
@@ -89,11 +89,12 @@ export async function initiateSmartfloClickToCall(
   const destinationNumber = normalizedDigits.length === 10 ? `91${normalizedDigits}` : normalizedDigits;
 
   // 4. Resolve Outbound Caller ID / Pilot DID
-  // Priority: user.smartfloCallerId -> config.smartfloCallerId
+  // Multi-agent Requirement: Must use the authenticated agent's assigned smartfloCallerId.
+  // config.smartfloCallerId is ONLY a fallback during migration.
   const callerId = (user.smartfloCallerId || config.smartfloCallerId || "").trim();
   if (!callerId) {
     throw new Error(
-      "Outbound Caller ID (SMARTFLO_CALLER_ID) is not configured. An approved account Caller ID is required."
+      "Please configure your Smartflo Caller ID in Profile Settings before initiating calls."
     );
   }
 

@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { Lead, ILead } from "../../models/Lead.js";
+import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
 import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
@@ -337,8 +338,46 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const hasRecording = recordingUrl.length > 0;
 
   // 8. Agent and Display Number (sanitize to string, never allow [object Object])
-  const agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
-  const agentNumber = String(payload.answered_agent_number ?? "").trim();
+  let agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
+  let agentNumber = String(payload.answered_agent_number ?? "").trim();
+  const callerDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? payload.caller_id ?? "").trim();
+
+  // Multi-Agent Correlation:
+  // If agentName or agentNumber is missing or generic, correlate against User database by extension or Caller ID
+  if (!agentName || agentName === "Smartflo Dialer" || !agentNumber) {
+    try {
+      const userConditions: any[] = [];
+      if (agentNumber) {
+        userConditions.push({ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber });
+      }
+      if (callerDid) {
+        const cleanDid = callerDid.replace(/\D/g, "");
+        if (cleanDid.length >= 10) {
+          const tenDigit = cleanDid.slice(-10);
+          userConditions.push(
+            { smartfloCallerId: callerDid },
+            { smartfloCallerId: `+91${tenDigit}` },
+            { smartfloCallerId: `91${tenDigit}` },
+            { smartfloCallerId: tenDigit }
+          );
+        }
+      }
+
+      if (userConditions.length > 0) {
+        const matchedUser = await User.findOne({ $or: userConditions }).select("name smartfloAgentId smartfloAgentNumber smartfloCallerId");
+        if (matchedUser) {
+          if (!agentName || agentName === "Smartflo Dialer") {
+            agentName = matchedUser.name;
+          }
+          if (!agentNumber) {
+            agentNumber = matchedUser.smartfloAgentId || matchedUser.smartfloAgentNumber || "";
+          }
+        }
+      }
+    } catch (userLookupErr: any) {
+      // non-blocking
+    }
+  }
 
   // 9. External CRM identifier passed back by dialer (custom parameter, custom_identifier, or explicit CRM id)
   const customIdent = payload.custom_identifier && typeof payload.custom_identifier === "object"

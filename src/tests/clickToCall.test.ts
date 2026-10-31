@@ -1,6 +1,7 @@
 import { initiateSmartfloClickToCall, _clearClickToCallDebounceMap } from "../services/smartflo/smartfloClickToCallService.js";
 import { executeSmartfloCallHangup, _clearHangupDebounceMap } from "../services/smartflo/smartfloHangupService.js";
 import { handleClickToCall, handleHangupCall } from "../controllers/smartfloController.js";
+import { updateMySmartfloExtension } from "../controllers/authController.js";
 import { processSmartfloWebhook } from "../services/smartflo/smartfloWebhookService.js";
 import { config } from "../config/env.js";
 import { _setMockTokenCache, invalidateSmartfloAccessToken } from "../services/smartflo/smartfloAuthService.js";
@@ -117,7 +118,7 @@ async function runClickToCallTests() {
         await initiateSmartfloClickToCall({ lead: mockLead, user: mockUserNoAgent });
       } catch (e: any) {
         threw = true;
-        assert("Rejects when agent telephony identifier is missing", e.message.includes("Please add your Smartflo Extension ID in Profile Settings."));
+        assert("Rejects when agent telephony identifier is missing", e.message.includes("Extension ID in Profile Settings"));
       }
       assert("Missing agent mapping threw error", threw);
     }
@@ -142,7 +143,7 @@ async function runClickToCallTests() {
         await initiateSmartfloClickToCall({ lead: mockLead, user: mockUser });
       } catch (e: any) {
         threw = true;
-        assert("Rejects when SMARTFLO_CALLER_ID is not configured", e.message.includes("Outbound Caller ID (SMARTFLO_CALLER_ID) is not configured"));
+        assert("Rejects when SMARTFLO_CALLER_ID is not configured", e.message.includes("Caller ID in Profile Settings"));
       }
       assert("Missing Caller ID threw error", threw);
       config.smartfloCallerId = "919999900000"; // restore
@@ -971,7 +972,7 @@ async function runClickToCallTests() {
 
       assert(
         "Missing extension blocks call with exact instruction message",
-        missingExtensionErrorMsg === "Please add your Smartflo Extension ID in Profile Settings."
+        missingExtensionErrorMsg.includes("Extension ID in Profile Settings")
       );
     }
 
@@ -1096,6 +1097,170 @@ async function runClickToCallTests() {
         SmartfloCallLog.findOneAndUpdate = origFindOneAndUpdate;
         SmartfloCallLog.findOne = origFindOneCallLog;
       }
+    }
+
+    // -------------------------------------------------------------
+    // Test 12: Multi-Agent Smartflo Configuration & Isolation
+    // -------------------------------------------------------------
+    {
+      _clearClickToCallDebounceMap();
+
+      // Agent 1: Priya Sharma, Extension 0601001, Caller ID +919228173971
+      // Agent 2: Rahul Verma, Extension 0602002, Caller ID +919228173972
+      let dispatchedPayloadAgent1: any = null;
+      let dispatchedPayloadAgent2: any = null;
+
+      const mockMultiAgentFetch = (async (url: string, opts: any) => {
+        if (url.includes("/v1/auth/login")) {
+          return new Response(JSON.stringify({ success: true, access_token: "mock-multi-agent-token" }), { status: 200 });
+        }
+        if (url.includes("/click_to_call")) {
+          const body = JSON.parse(opts.body);
+          if (body.agent_number === "0601001") {
+            dispatchedPayloadAgent1 = body;
+          } else if (body.agent_number === "0602002") {
+            dispatchedPayloadAgent2 = body;
+          }
+          return new Response(JSON.stringify({ success: true, ref_id: `REF_${body.agent_number}` }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      }) as any;
+
+      const leadSample1: any = {
+        _id: "lead_multi_1",
+        uniqueId: "SOI-MULTI-1",
+        primaryMobileNumber: "9876543210",
+        callingConsent: "Yes",
+      };
+
+      const leadSample2: any = {
+        _id: "lead_multi_2",
+        uniqueId: "SOI-MULTI-2",
+        primaryMobileNumber: "9123456789",
+        callingConsent: "Yes",
+      };
+
+      // Call initiated by Agent 1
+      const call1 = await initiateSmartfloClickToCall(
+        {
+          lead: leadSample1,
+          user: {
+            name: "Priya Sharma",
+            email: "priya@seedscrm.com",
+            role: "agent",
+            smartfloAgentId: "0601001",
+            smartfloCallerId: "+919228173971",
+          } as any,
+        },
+        mockMultiAgentFetch,
+        () => 800001
+      );
+
+      // Call initiated by Agent 2
+      const call2 = await initiateSmartfloClickToCall(
+        {
+          lead: leadSample2,
+          user: {
+            name: "Rahul Verma",
+            email: "rahul@seedscrm.com",
+            role: "agent",
+            smartfloAgentId: "0602002",
+            smartfloCallerId: "+919228173972",
+          } as any,
+        },
+        mockMultiAgentFetch,
+        () => 800002
+      );
+
+      assert("Agent 1 Click-to-call initiates successfully", call1.success === true);
+      assert("Agent 1 payload uses agent 1 extension", dispatchedPayloadAgent1?.agent_number === "0601001");
+      assert("Agent 1 payload uses agent 1 caller ID", dispatchedPayloadAgent1?.caller_id === "+919228173971");
+
+      assert("Agent 2 Click-to-call initiates successfully", call2.success === true);
+      assert("Agent 2 payload uses agent 2 extension", dispatchedPayloadAgent2?.agent_number === "0602002");
+      assert("Agent 2 payload uses agent 2 caller ID", dispatchedPayloadAgent2?.caller_id === "+919228173972");
+
+      // Verify missing caller ID blocks call when global caller ID is also unset
+      config.smartfloCallerId = "";
+      let missingCallerIdErr = "";
+      try {
+        await initiateSmartfloClickToCall(
+          {
+            lead: leadSample1,
+            user: {
+              name: "Agent No Caller ID",
+              email: "nocli@seedscrm.com",
+              role: "agent",
+              smartfloAgentId: "0603003",
+              smartfloCallerId: "",
+            } as any,
+          },
+          mockMultiAgentFetch,
+          () => 800003
+        );
+      } catch (err: any) {
+        missingCallerIdErr = err.message;
+      }
+      assert(
+        "Missing Caller ID blocks call with configuration guidance",
+        missingCallerIdErr.includes("Caller ID in Profile Settings")
+      );
+
+      // Verify Agent Self-Update cannot modify other users' settings
+      const origUserFindByIdAndUpdate = User.findByIdAndUpdate;
+      let targetUserIdUpdated = "";
+      let targetUpdateFields: any = null;
+
+      (User as any).findByIdAndUpdate = (id: any, update: any) => {
+        targetUserIdUpdated = String(id);
+        targetUpdateFields = update.$set;
+        return {
+          select: () =>
+            Promise.resolve({
+              _id: id,
+              name: "Priya Sharma",
+              email: "priya@seedscrm.com",
+              role: "agent",
+              smartfloAgentId: update.$set.smartfloAgentId,
+              smartfloCallerId: update.$set.smartfloCallerId,
+            }),
+        };
+      };
+
+      let selfUpdateStatus = 0;
+      let selfUpdateJson: any = null;
+      const selfUpdateRes: any = {
+        status: (code: number) => {
+          selfUpdateStatus = code;
+          return {
+            json: (payload: any) => {
+              selfUpdateJson = payload;
+            },
+          };
+        },
+      };
+
+      // Malicious attempt: Agent 1 tries to send arbitrary userId in body
+      const maliciousReq: any = {
+        user: { id: "authenticated_priya_id", role: "agent" },
+        body: {
+          userId: "victim_rahul_id",
+          smartfloAgentId: "0609999",
+          smartfloCallerId: "+919228173999",
+        },
+      };
+
+      await updateMySmartfloExtension(maliciousReq, selfUpdateRes);
+
+      assert("Self-update responds with HTTP 200", selfUpdateStatus === 200);
+      assert("Self-update updates strictly authenticated session id, ignoring malicious body userId", targetUserIdUpdated === "authenticated_priya_id");
+      assert("Self-update persists caller ID", targetUpdateFields.smartfloCallerId === "+919228173999");
+      assert("Self-update persists extension ID", targetUpdateFields.smartfloAgentId === "0609999");
+
+      User.findByIdAndUpdate = origUserFindByIdAndUpdate;
     }
 
   } finally {
