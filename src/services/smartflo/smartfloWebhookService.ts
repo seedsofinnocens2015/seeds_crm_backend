@@ -80,14 +80,46 @@ export interface WebhookProcessingResult {
 /**
  * Normalizes call status string into standard CRM enum.
  */
-function normalizeCallStatus(raw: string): "answered" | "missed" | "busy" | "failed" | "no_answer" | "in_progress" | "unknown" {
+function normalizeCallStatus(raw: string, payload?: SmartfloWebhookPayload): "answered" | "missed" | "busy" | "failed" | "no_answer" | "in_progress" | "unknown" {
   const s = (raw || "").toLowerCase().trim();
+  
+  // Also check Smartflo event/trigger indicators if status is empty or generic
+  const eventIndicator = String(
+    payload?.event ??
+    payload?.event_type ??
+    payload?.trigger ??
+    payload?.webhook_event ??
+    payload?.notification_type ??
+    ""
+  ).toLowerCase().trim();
+
+  // If payload contains explicit event trigger names from Smartflo:
+  // "Call received on Server" or "ringing" -> in_progress
+  if (
+    eventIndicator.includes("received") ||
+    eventIndicator.includes("server") ||
+    eventIndicator.includes("ring") ||
+    eventIndicator.includes("initiate") ||
+    eventIndicator.includes("start")
+  ) {
+    if (!s.includes("answer") && !s.includes("miss") && !s.includes("hangup")) {
+      return "in_progress";
+    }
+  }
+
+  // "Call answered by Agent" -> answered
+  if (eventIndicator.includes("answered") || eventIndicator.includes("picked")) {
+    if (!s.includes("miss") && !s.includes("hangup") && !s.includes("end")) {
+      return "answered";
+    }
+  }
+
   if (s.includes("answer") || s === "connected" || s === "success") return "answered";
   if (s.includes("miss")) return "missed";
   if (s.includes("busy")) return "busy";
   if (s.includes("no") && s.includes("answer")) return "no_answer";
   if (s.includes("fail") || s.includes("cancel")) return "failed";
-  if (s.includes("progress") || s.includes("ring")) return "in_progress";
+  if (s.includes("progress") || s.includes("ring") || s.includes("received") || s.includes("initiat")) return "in_progress";
   return "unknown";
 }
 
@@ -267,8 +299,16 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const normalizedPhone = customerNumber ? (normalizePhoneNumber(customerNumber) || customerNumber.replace(/\D/g, "")) : "";
 
   // 4. Status normalization
-  const rawStatus = payload.Status ?? payload.call_status ?? payload.status ?? "";
-  const status = normalizeCallStatus(String(rawStatus));
+  const rawStatus = payload.Status ?? payload.call_status ?? payload.status ?? payload.event ?? payload.trigger ?? "";
+  const status = normalizeCallStatus(String(rawStatus), payload);
+
+  // Safe diagnostic log (Never log sensitive auth tokens, passwords or secrets)
+  const eventIdentifier = String(
+    payload.event ?? payload.event_type ?? payload.trigger ?? payload.webhook_event ?? payload.Status ?? payload.call_status ?? payload.status ?? "unknown"
+  );
+  console.info(
+    `[Smartflo Webhook] Ingested Event: callId=${callId}, event="${eventIdentifier}", direction=${direction}, status=${status}, caller=${customerNumber ? customerNumber.slice(-4).padStart(customerNumber.length, "*") : "none"}`
+  );
 
   // 5. Safe duration calculations
   const totalDuration = parseSafeDuration(payload.CallDuration ?? payload.duration);
@@ -516,12 +556,16 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     };
 
     if (status === "in_progress") {
+      console.info(`[Smartflo Webhook] Emitting inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}`);
       broadcastInboundCallEvent("inbound:ringing", notificationPayload);
     } else if (status === "answered") {
+      console.info(`[Smartflo Webhook] Emitting inbound:answered for callId=${callId}, leadMatched=${!!matchedLead}`);
       broadcastInboundCallEvent("inbound:answered", notificationPayload);
     } else if (status === "missed") {
+      console.info(`[Smartflo Webhook] Emitting inbound:missed for callId=${callId}, leadMatched=${!!matchedLead}`);
       broadcastInboundCallEvent("inbound:missed", notificationPayload);
     } else {
+      console.info(`[Smartflo Webhook] Emitting inbound:ended for callId=${callId}, leadMatched=${!!matchedLead}`);
       broadcastInboundCallEvent("inbound:ended", notificationPayload);
     }
   }
