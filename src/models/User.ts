@@ -8,6 +8,7 @@ export interface IUser extends Document {
   role: "admin" | "team_leader" | "agent" | "mis" | "marketing";
   status?: "active" | "inactive";
   smartfloAgentNumber?: string; // Smartflo Agent Mobile, Agent ID (050xxxx), or Softphone Extension (060xxxx)
+  smartfloAgentId?: string; // Explicit alias for smartfloAgentNumber
   smartfloCallerId?: string; // Optional user-specific outbound CLI override
   createdBy?: mongoose.Types.ObjectId;
   createdAt: Date;
@@ -48,6 +49,11 @@ const UserSchema = new Schema<IUser>(
       default: "active",
     },
     smartfloAgentNumber: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    smartfloAgentId: {
       type: String,
       default: "",
       trim: true,

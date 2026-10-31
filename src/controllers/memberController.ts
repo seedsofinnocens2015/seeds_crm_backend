@@ -35,7 +35,7 @@ export async function getMembers(req: Request, res: Response) {
 export async function createMember(req: Request, res: Response) {
   try {
     const authUser = req.user!;
-    const { name, mobile, email, password, role, smartfloAgentNumber } = req.body;
+    const { name, mobile, email, password, role, smartfloAgentNumber, smartfloAgentId } = req.body;
 
     if (!name || !mobile || !email || !password || !role) {
       return res.status(400).json({
@@ -70,6 +70,10 @@ export async function createMember(req: Request, res: Response) {
 
     const hashedPassword = await bcrypt.hash(String(password), 10);
 
+    const extensionValue = (smartfloAgentId !== undefined ? smartfloAgentId : smartfloAgentNumber)
+      ? String(smartfloAgentId || smartfloAgentNumber).trim()
+      : "";
+
     const newMember = await User.create({
       name: String(name).trim(),
       mobile: String(mobile).trim(),
@@ -77,7 +81,8 @@ export async function createMember(req: Request, res: Response) {
       password: hashedPassword,
       role: cleanRole,
       status: "active",
-      smartfloAgentNumber: smartfloAgentNumber ? String(smartfloAgentNumber).trim() : "",
+      smartfloAgentNumber: extensionValue,
+      smartfloAgentId: extensionValue,
       createdBy: new mongoose.Types.ObjectId(authUser.id),
     });
 
@@ -100,6 +105,7 @@ export async function createMember(req: Request, res: Response) {
         role: newMember.role,
         status: newMember.status || "active",
         smartfloAgentNumber: newMember.smartfloAgentNumber || "",
+        smartfloAgentId: newMember.smartfloAgentId || newMember.smartfloAgentNumber || "",
         createdAt: newMember.createdAt,
       },
     });
@@ -161,7 +167,7 @@ export async function updateMember(req: Request, res: Response) {
     }
 
     const body = req.body;
-    const { name, mobile, email, role, status, password, smartfloAgentNumber } = body;
+    const { name, mobile, email, role, status, password, smartfloAgentNumber, smartfloAgentId } = body;
 
     const member = await User.findById(id);
     if (!member) {
@@ -206,8 +212,11 @@ export async function updateMember(req: Request, res: Response) {
     if (status && ["active", "inactive"].includes(status)) {
       updateFields.status = status;
     }
-    if (smartfloAgentNumber !== undefined) {
-      updateFields.smartfloAgentNumber = String(smartfloAgentNumber).trim();
+    const finalExtension = smartfloAgentId !== undefined ? smartfloAgentId : smartfloAgentNumber;
+    if (finalExtension !== undefined) {
+      const cleanExt = String(finalExtension).trim();
+      updateFields.smartfloAgentNumber = cleanExt;
+      updateFields.smartfloAgentId = cleanExt;
     }
 
     // Optional password reset

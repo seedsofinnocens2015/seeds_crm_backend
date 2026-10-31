@@ -75,10 +75,14 @@ export async function login(req: Request, res: Response) {
       message: "Login successful",
       user: {
         id: user._id,
+        _id: user._id,
         name: user.name,
         email: user.email,
         mobile: user.mobile,
         role: user.role,
+        smartfloAgentId: user.smartfloAgentId || user.smartfloAgentNumber || "",
+        smartfloAgentNumber: user.smartfloAgentNumber || user.smartfloAgentId || "",
+        smartfloCallerId: user.smartfloCallerId || "",
       },
       // Note: We also return token in body for automated API testing/tools while cookies handle the browser
       token,
@@ -128,7 +132,19 @@ export async function getMe(req: Request, res: Response) {
     }
 
     return res.status(200).json({
-      user,
+      user: {
+        id: user._id,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        mobile: user.mobile,
+        role: user.role,
+        status: user.status,
+        smartfloAgentId: user.smartfloAgentId || user.smartfloAgentNumber || "",
+        smartfloAgentNumber: user.smartfloAgentNumber || user.smartfloAgentId || "",
+        smartfloCallerId: user.smartfloCallerId || "",
+        createdAt: user.createdAt,
+      },
       token,
     });
   } catch (error: any) {
@@ -188,12 +204,98 @@ export async function signupAdmin(req: Request, res: Response) {
         name: newAdmin.name,
         email: newAdmin.email,
         role: newAdmin.role,
+        smartfloAgentId: newAdmin.smartfloAgentId || newAdmin.smartfloAgentNumber || "",
+        smartfloAgentNumber: newAdmin.smartfloAgentNumber || newAdmin.smartfloAgentId || "",
       },
     });
   } catch (error: any) {
     console.error("Admin signup error:", error);
     return res.status(500).json({
       error: error.message || "Something went wrong during signup.",
+    });
+  }
+}
+
+/**
+ * PUT /api/v1/auth/smartflo-extension
+ * Protected self-service endpoint for authenticated users to update their own Smartflo Extension ID.
+ * Strictly derives the user ID from req.user (authenticated JWT/session), never accepting client userId.
+ */
+export async function updateMySmartfloExtension(req: Request, res: Response) {
+  try {
+    const authUser = req.user;
+    if (!authUser || !authUser.id) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "Authentication token missing or invalid.",
+      });
+    }
+
+    const { smartfloAgentId, smartfloAgentNumber } = req.body || {};
+    const rawVal = smartfloAgentId !== undefined ? smartfloAgentId : smartfloAgentNumber;
+
+    if (rawVal === undefined || rawVal === null) {
+      return res.status(400).json({
+        error: "Bad Request",
+        message: "Missing 'smartfloAgentId' or 'smartfloAgentNumber' parameter.",
+      });
+    }
+
+    const cleanVal = String(rawVal).trim();
+
+    // Validate alphanumeric/digits format up to 30 chars (handles extensions like 0608426290047, softphone IDs, mobiles)
+    if (cleanVal.length > 30) {
+      return res.status(400).json({
+        error: "Invalid extension ID",
+        message: "Extension ID cannot exceed 30 characters.",
+      });
+    }
+
+    if (cleanVal && !/^[0-9a-zA-Z_-]+$/.test(cleanVal)) {
+      return res.status(400).json({
+        error: "Invalid extension ID",
+        message: "Extension ID may only contain numbers, letters, underscores, and hyphens.",
+      });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      authUser.id,
+      {
+        $set: {
+          smartfloAgentId: cleanVal,
+          smartfloAgentNumber: cleanVal,
+        },
+      },
+      { new: true }
+    ).select("-password");
+
+    if (!updatedUser) {
+      return res.status(404).json({
+        error: "User not found",
+        message: "Authenticated user profile does not exist.",
+      });
+    }
+
+    return res.status(200).json({
+      status: "success",
+      message: "Smartflo extension ID updated successfully.",
+      smartfloAgentId: updatedUser.smartfloAgentId || updatedUser.smartfloAgentNumber || "",
+      smartfloAgentNumber: updatedUser.smartfloAgentNumber || updatedUser.smartfloAgentId || "",
+      user: {
+        id: updatedUser._id,
+        _id: updatedUser._id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        smartfloAgentId: updatedUser.smartfloAgentId || updatedUser.smartfloAgentNumber || "",
+        smartfloAgentNumber: updatedUser.smartfloAgentNumber || updatedUser.smartfloAgentId || "",
+      },
+    });
+  } catch (error: any) {
+    console.error("Error updating Smartflo extension:", error);
+    return res.status(500).json({
+      error: "Internal Server Error",
+      message: error.message || "Failed to update extension ID.",
     });
   }
 }

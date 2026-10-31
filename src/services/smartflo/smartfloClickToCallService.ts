@@ -6,7 +6,7 @@ import { ILead } from "../../models/Lead.js";
 
 export interface ClickToCallParams {
   lead: ILead;
-  user: IUser | { id?: string; name: string; email: string; role: string; mobile?: string; smartfloAgentNumber?: string; smartfloCallerId?: string };
+  user: IUser | { id?: string; name: string; email: string; role: string; mobile?: string; smartfloAgentNumber?: string; smartfloAgentId?: string; smartfloCallerId?: string };
   targetPhoneOverride?: string;
   callTimeoutSeconds?: number;
 }
@@ -65,11 +65,11 @@ export async function initiateSmartfloClickToCall(
   }
 
   // 2. Resolve & Validate Agent Number
-  // Priority: user.smartfloAgentNumber -> user.mobile (if registered on Smartflo)
-  const resolvedAgent = (user.smartfloAgentNumber || "").trim();
+  // Priority: user.smartfloAgentId -> user.smartfloAgentNumber -> user.mobile (if registered on Smartflo)
+  const resolvedAgent = (user.smartfloAgentId || user.smartfloAgentNumber || "").trim();
   if (!resolvedAgent) {
     throw new Error(
-      "Agent telephony identifier not configured. Please assign a Smartflo Agent Number / Extension in user profile."
+      "Please add your Smartflo Extension ID in Profile Settings."
     );
   }
 

@@ -116,7 +116,7 @@ async function runClickToCallTests() {
         await initiateSmartfloClickToCall({ lead: mockLead, user: mockUserNoAgent });
       } catch (e: any) {
         threw = true;
-        assert("Rejects when agent telephony identifier is missing", e.message.includes("Agent telephony identifier not configured"));
+        assert("Rejects when agent telephony identifier is missing", e.message.includes("Please add your Smartflo Extension ID in Profile Settings."));
       }
       assert("Missing agent mapping threw error", threw);
     }
@@ -808,6 +808,170 @@ async function runClickToCallTests() {
         invalidRejected = true;
       }
       assert("Invalid token throws verification error", invalidRejected === true);
+    }
+
+    // -------------------------------------------------------------
+    // Test 10: Self-Service Smartflo Extension ID Management & C2C
+    // -------------------------------------------------------------
+    {
+      const { updateMySmartfloExtension } = await import("../controllers/authController.js");
+
+      // 10A: Unauthorized access rejected when req.user is missing
+      let unauthCode = 0;
+      let unauthMsg = "";
+      const reqNoAuth: any = { body: { smartfloAgentId: "0608426290047" } };
+      const resNoAuth: any = {
+        status: (code: number) => {
+          unauthCode = code;
+          return {
+            json: (data: any) => {
+              unauthMsg = data.message || data.error;
+            },
+          };
+        },
+      };
+      await updateMySmartfloExtension(reqNoAuth, resNoAuth);
+      assert("Self-update rejects unauthenticated access (401)", unauthCode === 401);
+
+      // 10B: Validation rejection for extension exceeding length or invalid characters
+      let valCode = 0;
+      let valMsg = "";
+      const reqInvalid: any = {
+        user: { id: "user_test_123", role: "agent" },
+        body: { smartfloAgentId: "060@invalid$extension!#%" },
+      };
+      const resInvalid: any = {
+        status: (code: number) => {
+          valCode = code;
+          return {
+            json: (data: any) => {
+              valMsg = data.message || data.error;
+            },
+          };
+        },
+      };
+      await updateMySmartfloExtension(reqInvalid, resInvalid);
+      assert("Self-update rejects invalid extension format (400)", valCode === 400);
+
+      // 10C: Authenticated user self-update uses session id and never accepts arbitrary client userId
+      const origFindByIdAndUpdate = (User as any).findByIdAndUpdate;
+      let updatedUserId = "";
+      let updatedFields: any = null;
+
+      (User as any).findByIdAndUpdate = (id: string, update: any) => {
+        updatedUserId = id;
+        updatedFields = update.$set;
+        return {
+          select: () => ({
+            _id: id,
+            name: "Agent Test",
+            email: "agent@seeds.com",
+            role: "agent",
+            smartfloAgentId: update.$set.smartfloAgentId,
+            smartfloAgentNumber: update.$set.smartfloAgentNumber,
+          }),
+        };
+      };
+
+      try {
+        let successCode = 0;
+        let successBody: any = null;
+        const reqValid: any = {
+          user: { id: "actual_session_user_id", role: "agent" },
+          body: {
+            userId: "malicious_spoofed_user_id", // Client attempts to spoof another member's ID
+            smartfloAgentId: "0608426290047",
+          },
+        };
+        const resValid: any = {
+          status: (code: number) => {
+            successCode = code;
+            return {
+              json: (data: any) => {
+                successBody = data;
+              },
+            };
+          },
+        };
+
+        await updateMySmartfloExtension(reqValid, resValid);
+        assert("Self-update responds with HTTP 200 OK", successCode === 200);
+        assert("Self-update updates authenticated user from session, ignoring client userId", updatedUserId === "actual_session_user_id");
+        assert("Stores extension ID in smartfloAgentId", updatedFields.smartfloAgentId === "0608426290047");
+        assert("Stores extension ID in smartfloAgentNumber alias", updatedFields.smartfloAgentNumber === "0608426290047");
+        assert("Returns updated extension ID in response payload", successBody.smartfloAgentId === "0608426290047");
+      } finally {
+        (User as any).findByIdAndUpdate = origFindByIdAndUpdate;
+      }
+
+      // 10D: Click-to-Call uses saved smartfloAgentId
+      let dispatchedAgentNumber = "";
+      const mockFetchForAgent = async (url: any, opts: any) => {
+        const body = JSON.parse(opts.body);
+        dispatchedAgentNumber = body.agent_number;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            ref_id: "REF_AGENT_SAVED_101",
+            message: "Call initiated successfully",
+          }),
+        } as any;
+      };
+
+      const c2cResult = await initiateSmartfloClickToCall(
+        {
+          lead: {
+            uniqueId: "SOI-9001",
+            wifeName: "Ananya",
+            husbandName: "Rahul",
+            primaryMobileNumber: "9876543210",
+            callingConsent: "Yes",
+          } as any,
+          user: {
+            name: "Agent Anjali",
+            email: "anjali@seeds.com",
+            role: "agent",
+            smartfloAgentId: "0608426290047", // Saved extension ID
+          } as any,
+        },
+        mockFetchForAgent,
+        () => 900001
+      );
+
+      assert("Click-to-call with saved smartfloAgentId succeeds", c2cResult.success === true);
+      assert("Dispatches saved extension 0608426290047 as agent_number", dispatchedAgentNumber === "0608426290047");
+
+      // 10E: When extension ID is missing, Click-to-Call is blocked with user-friendly instruction
+      let missingExtensionErrorMsg = "";
+      try {
+        await initiateSmartfloClickToCall(
+          {
+            lead: {
+              uniqueId: "SOI-9002",
+              primaryMobileNumber: "9876543210",
+              callingConsent: "Yes",
+            } as any,
+            user: {
+              name: "Agent Without Extension",
+              email: "noext@seeds.com",
+              role: "agent",
+              smartfloAgentId: "",
+              smartfloAgentNumber: "",
+            } as any,
+          },
+          mockFetchForAgent,
+          () => 900002
+        );
+      } catch (err: any) {
+        missingExtensionErrorMsg = err.message;
+      }
+
+      assert(
+        "Missing extension blocks call with exact instruction message",
+        missingExtensionErrorMsg === "Please add your Smartflo Extension ID in Profile Settings."
+      );
     }
 
   } finally {
