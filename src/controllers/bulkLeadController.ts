@@ -223,7 +223,7 @@ export async function bulkUploadLeads(req: Request, res: Response) {
       if (!finalMonth) finalMonth = monthFromDDMMMYYServer(finalDate) || defaultMonth;
       if (!finalTimestamp) finalTimestamp = currentTimestamp;
 
-      let rawCaller = String(item.callerName || "").trim();
+      const rawCaller = String(item.callerName || item.leadOwner || "").trim();
       let sanitizedCaller = "";
       if (rawCaller && rawCaller.toUpperCase() !== "NA") {
         const matchedName = validCallerNamesMap.get(rawCaller.toLowerCase());
@@ -231,37 +231,94 @@ export async function bulkUploadLeads(req: Request, res: Response) {
       }
 
       const normPhone = normalizePhoneNumber(mobile) || mobile;
-      const altNumber = String(item.alternateNumber || "").trim();
+      const altNumber = String(item.alternateNumber || item.secondaryMobileNumber || "").trim();
       const normAlt = altNumber ? normalizePhoneNumber(altNumber) || "" : "";
+
+      const wife = String(item.wifeName || item.patientName || "").trim();
+      const husband = String(item.husbandName || item.spouseName || "").trim();
+      const wifeAge = String(item.wifeAge || item.patientAge || "").trim();
+      const husbandAge = String(item.husbandAge || item.spouseAge || "").trim();
+      const centreLoc = String(item.centreLocation || item.location || item.otherCity || "").trim();
+      const campLoc = String(item.campLocation || "").trim();
+      const leadSrc = String(item.leadSource || item.utmSource || "").trim();
+      const followUp = String(item.followUpDateTime || item.followUpDate || item.followUpDates || "").trim();
+      const firstActDate = String(item.firstActivityDate || finalTimestamp || "").trim();
 
       leadsToInsert.push({
         uniqueId: assignedId,
         date: finalDate,
         month: finalMonth,
         leadTimestamp: finalTimestamp,
+        firstActivityDate: firstActDate,
         mobileNumber: mobile,
         phoneNumber: mobile,
+        primaryMobileNumber: mobile,
         alternateNumber: altNumber,
+        secondaryMobileNumber: altNumber,
+        whatsappMobileNumber: String(item.whatsappMobileNumber || "").trim(),
+        otherNumbers: String(item.otherNumbers || "").trim(),
+        whatsappConsent: String(item.whatsappConsent || "No").trim(),
+        callingConsent: String(item.callingConsent || "No").trim(),
+        primaryEmail: String(item.primaryEmail || "").trim(),
+        secondaryEmail: String(item.secondaryEmail || "").trim(),
         normalizedPhone: normPhone,
         normalizedAlternate: normAlt,
         callerName: sanitizedCaller,
-        patientName: String(item.patientName || "").trim(),
-        patientAge: String(item.patientAge || "").trim(),
-        spouseName: String(item.spouseName || "").trim(),
-        spouseAge: String(item.spouseAge || "").trim(),
-        location: String(item.location || item.otherCity || "").trim(),
+        leadOwner: String(item.leadOwner || sanitizedCaller || "").trim(),
+        createdByMember: String(item.createdByMember || item.createdBy || session.name || "Admin").trim(),
+        createdOn: String(item.createdOn || finalTimestamp).trim(),
+        modifiedByMember: String(item.modifiedByMember || item.modifiedBy || session.name || "Admin").trim(),
+        modifiedOn: String(item.modifiedOn || finalTimestamp).trim(),
+        wifeName: wife,
+        patientName: wife,
+        husbandName: husband,
+        spouseName: husband,
+        wifeAge: wifeAge,
+        patientAge: wifeAge,
+        husbandAge: husbandAge,
+        spouseAge: husbandAge,
+        whenPlanningToStartTreatment: String(item.whenPlanningToStartTreatment || item.lookingForTreatment || "").trim(),
+        preMedicalConditions: String(item.preMedicalConditions || item.preConditions || item.preCondition || "No").trim(),
+        marriedSince: String(item.marriedSince || "").trim(),
+        tryingToConceiveYears: String(item.tryingToConceiveYears || "").trim(),
+        campaignName: String(item.campaignName || "").trim(),
+        sourceName: String(item.sourceName || "").trim(),
+        source: String(item.source || "General").trim(),
+        leadScore: String(item.leadScore || "0").trim(),
+        subStatus: subDisp,
+        leadStage: disp,
+        leadValidStatus: valid,
+        centreAddress: String(item.centreAddress || (centreLoc ? `${centreLoc} Centre` : "")).trim(),
+        ptAddress: String(item.ptAddress || "").trim(),
+        ptPincode: String(item.ptPincode || "").trim(),
+        ptCountry: String(item.ptCountry || "India").trim(),
+        ptState: String(item.ptState || "").trim(),
+        ptCity: String(item.ptCity || "").trim(),
+        leadAge: String(item.leadAge || "0 days").trim(),
+        campLocation: campLoc,
+        centreLocation: centreLoc,
+        location: centreLoc,
         otherCity: String(item.otherCity || "").trim(),
+        followUpDateTime: followUp,
+        followUpDate: parseAnyDateServer(followUp),
+        centreVisitedDate: parseAnyDateServer(item.centreVisitedDate || ""),
+        campVisitedDate: parseAnyDateServer(item.campVisitedDate || ""),
+        registrationStatus: String(item.registrationStatus || "No").trim(),
+        registrationNumber: String(item.registrationNumber || "").trim(),
+        registrationAmount: String(item.registrationAmount || "").trim(),
+        package: String(item.package || "").trim(),
+        plan: String(item.plan || "").trim(),
         lookingForTreatment: String(
-          item.lookingForTreatment || item.treatmentRequired || item.treatment || ""
+          item.lookingForTreatment || item.whenPlanningToStartTreatment || item.treatmentRequired || item.treatment || ""
         ).trim(),
         treatmentRequirements: String(
           item.treatmentRequirements || item.treatmentRequired || ""
         ).trim(),
-        preConditions: String(item.preConditions || item.preCondition || "").trim(),
+        preConditions: String(item.preConditions || item.preMedicalConditions || item.preCondition || "").trim(),
         surgeryDetails: String(item.surgeryDetails || item.surgicalData || "").trim(),
         referredBy: String(item.referredBy || "").trim(),
-        leadSource: String(item.leadSource || "").trim(),
-        followUpDate: parseAnyDateServer(item.followUpDate || item.followUpDates || ""),
+        leadSource: leadSrc,
+        utmSource: String(item.utmSource || leadSrc || "").trim(),
         subDispositions: subDisp,
         dispositions: disp,
         validStatus: valid,
