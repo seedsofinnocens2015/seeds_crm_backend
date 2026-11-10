@@ -403,12 +403,91 @@ async function runTests() {
     const noDirectionPayload: SmartfloWebhookPayload = {
       CallSessionId: "SESSION-NODIR-555",
       customer_number: "9876543210",
-      SourceNumber: "01140844000",
-      DestinationNumber: "9876543210",
+      SourceNumber: "9998887776", // Unknown non-DID number
+      DestinationNumber: "9876543210", // Unknown non-DID customer
     };
     await processSmartfloWebhook(noDirectionPayload);
-    assert("Missing direction normalized to 'unknown'", savedCallLogDoc.direction === "unknown");
+    assert("Missing direction normalized to 'unknown' when neither party is a known DID", savedCallLogDoc.direction === "unknown");
     assert("Missing direction safely prioritizes explicit customer_number", savedCallLogDoc.customerNumber === "9876543210");
+
+    // 5.8 Real Production Initial In-Flight Smartflo Inbound Webhook (Sparse Payload)
+    // No event, event_type, trigger, direction, call_status, or status fields present
+    existingCallLogDoc = null;
+    leadAuditPushes = [];
+    const prodInitialInboundPayload: SmartfloWebhookPayload = {
+      call_id: "HYD11-T15-1794296177.20915",
+      uuid: "7e3b8a10-2345-6789-abcd-ef0123456789",
+      caller_id: "9876543210", // Customer caller
+      caller_id_number: "9876543210",
+      called_number: "01140844000", // Seeds CRM Pilot DID
+      call_to_number: "01140844000",
+      billing_circle: "Delhi",
+      start_stamp: "2026-11-10 12:45:00",
+      call_flow: [
+        { step: "ivr", name: "Main_IVR", time: "2026-11-10 12:45:00" },
+        { step: "queue", name: "General_Queue", time: "2026-11-10 12:45:01" },
+      ],
+    };
+
+    const initialInboundResult = await processSmartfloWebhook(prodInitialInboundPayload);
+    assert("Sparse production initial inbound webhook processed successfully", initialInboundResult.success === true);
+    assert("Direction correctly inferred as 'inbound' from business DID match", savedCallLogDoc.direction === "inbound");
+    assert("Status correctly normalized to 'in_progress' for initial in-flight event", savedCallLogDoc.status === "in_progress");
+    assert("Customer number extracted from caller_id_number", savedCallLogDoc.customerNumber === "9876543210");
+    assert("Lead correlated via normalized phone", savedCallLogDoc.crmLeadUniqueId === "SOI-1042");
+
+    // 5.9 Auto Answer: Immediate Answered Event Updates Existing Session (No Duplicate)
+    const autoAnswerPayload: SmartfloWebhookPayload = {
+      call_id: "HYD11-T15-1794296177.20915",
+      caller_id_number: "9876543210",
+      call_to_number: "01140844000",
+      answered_agent_number: "0608426290047",
+      answered_agent: "Aarti Sharma",
+      call_status: "answered",
+      answer_stamp: "2026-11-10 12:45:02",
+    };
+    existingCallLogDoc = { ...savedCallLogDoc };
+    const autoAnswerResult = await processSmartfloWebhook(autoAnswerPayload);
+    assert("Auto-answer event processed as update (isDuplicate: true)", autoAnswerResult.isDuplicate === true);
+    assert("Auto-answer updates existing status to 'answered'", savedCallLogDoc.status === "answered");
+    assert("Auto-answer captures agent name", savedCallLogDoc.agentName === "Aarti Sharma");
+
+    // 5.10 Call Hangup: Updates Existing Call Log (Preserves Call ID & Upsert Idempotency)
+    const hangupPayload: SmartfloWebhookPayload = {
+      CallSessionId: "HYD11-T15-1794296177.20915",
+      SourceNumber: "9876543210",
+      DestinationNumber: "01140844000",
+      Direction: "Inbound",
+      Status: "Answered",
+      CallDuration: 75,
+      answered_duration: 72,
+      recording_url: "https://api-smartflo.tatateleservices.com/recordings/test.mp3",
+      hangup_cause_description: "Normal call clearing",
+    };
+    existingCallLogDoc = { ...savedCallLogDoc };
+    const hangupResult = await processSmartfloWebhook(hangupPayload);
+    assert("Hangup event updates existing record (isDuplicate: true)", hangupResult.isDuplicate === true);
+    assert("Hangup event preserves 'answered' status", savedCallLogDoc.status === "answered");
+    assert("Hangup event records duration (75s)", savedCallLogDoc.durationSeconds === 75);
+    assert("Hangup event attaches recording URL", savedCallLogDoc.recordingUrl.includes("test.mp3"));
+
+    // 5.11 Out-of-Order / Delayed Ringing Event Does NOT Overwrite Terminal Answered State
+    existingCallLogDoc = { ...savedCallLogDoc };
+    await processSmartfloWebhook(prodInitialInboundPayload);
+    assert("Delayed ringing event does not regress status from answered to in_progress", savedCallLogDoc.status === "answered");
+    assert("Delayed ringing preserves recording URL", savedCallLogDoc.recordingAvailable === true);
+
+    // 5.12 Unknown Destination Number is Not Blindly Classified as Inbound
+    existingCallLogDoc = null;
+    const unknownDestPayload: SmartfloWebhookPayload = {
+      call_id: "SESSION-UNKNOWN-DID-999",
+      caller_id: "9876543210",
+      called_number: "919999888877", // Random non-business number
+      start_stamp: "2026-11-10 12:45:00",
+    };
+    await processSmartfloWebhook(unknownDestPayload);
+    assert("Unknown destination number does not blindly infer inbound", savedCallLogDoc.direction === "unknown");
+    assert("Unknown destination number does not infer in_progress without DID match", savedCallLogDoc.status === "unknown");
   } finally {
     // Restore DB methods
     Lead.findOne = origFindOneLead;

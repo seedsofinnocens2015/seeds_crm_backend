@@ -4,6 +4,8 @@ import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
 import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
+import { config } from "../../config/env.js";
+import { SOURCE_NAME_TO_INFO } from "../../utils/dateUtils.js";
 
 export interface SmartfloWebhookPayload {
   // Call ID aliases
@@ -14,8 +16,10 @@ export interface SmartfloWebhookPayload {
   // Phone number aliases
   SourceNumber?: string | number;
   caller_id_number?: string | number;
+  caller_id?: string | number;
   DestinationNumber?: string | number;
   call_to_number?: string | number;
+  called_number?: string | number;
   DisplayNumber?: string | number;
   customer_number?: string | number;
 
@@ -79,6 +83,76 @@ export interface WebhookProcessingResult {
 }
 
 /**
+ * Checks whether a given phone number/string matches our company's business virtual numbers (DIDs).
+ * Checks config.smartfloCallerId, dateUtils SOURCE_NAME_TO_INFO DID numbers, and common Seeds CRM DIDs.
+ */
+export function isKnownBusinessDid(phoneCandidate: string | number | undefined | null): boolean {
+  if (!phoneCandidate && phoneCandidate !== 0) return false;
+  const str = String(phoneCandidate).trim();
+  if (!str) return false;
+
+  const rawClean = str.replace(/\D/g, "");
+  if (rawClean.length < 8) return false;
+
+  const tenDigit = rawClean.slice(-10);
+
+  // 1. Configured account Pilot DID / Caller ID (e.g. +919228173971)
+  if (config.smartfloCallerId) {
+    const configClean = config.smartfloCallerId.replace(/\D/g, "");
+    if (configClean && (configClean.includes(tenDigit) || tenDigit.includes(configClean.slice(-10)))) {
+      return true;
+    }
+  }
+
+  // 2. Verified DIDs from SOURCE_NAME_TO_INFO (115+ Seeds IVF campaign numbers)
+  if (SOURCE_NAME_TO_INFO[tenDigit] || SOURCE_NAME_TO_INFO[rawClean] || SOURCE_NAME_TO_INFO[`91${tenDigit}`]) {
+    return true;
+  }
+
+  // 3. Known Seeds of Innocens Pilot Landline / Virtual DIDs (011-4084xxxx, 011-411xxxxx)
+  if (rawClean.startsWith("11408") || rawClean.startsWith("011408") || rawClean.startsWith("11411") || rawClean.startsWith("011411")) {
+    return true;
+  }
+
+  // 4. Check if number exists in User table as smartfloCallerId
+  // (handled separately if needed, but primary DID list above covers all active trunks)
+  return false;
+}
+
+/**
+ * Detects whether the payload represents Smartflo's characteristic in-flight "Call received on Server"
+ * initial webhook, which omits event, direction, and status, but contains call_id, caller/called numbers,
+ * start_stamp and/or call_flow.
+ */
+export function isInitialInboundProgressPayload(payload: SmartfloWebhookPayload): boolean {
+  const rawCallId = payload.CallSessionId ?? payload.call_id ?? payload.callId;
+  if (!rawCallId) return false;
+
+  // If payload already has explicit terminal statuses (answered, missed, ended, failed), it's not the initial event
+  const rawStatus = String(payload.Status ?? payload.call_status ?? payload.status ?? "").toLowerCase().trim();
+  if (rawStatus.includes("answer") || rawStatus.includes("miss") || rawStatus.includes("fail") || rawStatus.includes("end") || rawStatus.includes("busy")) {
+    return false;
+  }
+
+  // Check caller and called numbers
+  const caller = String(payload.caller_id_number ?? payload.caller_id ?? payload.SourceNumber ?? "").trim();
+  const called = String(payload.called_number ?? payload.call_to_number ?? payload.DestinationNumber ?? "").trim();
+
+  if (!caller && !called) return false;
+
+  // Called number must be our known company business DID
+  const calledIsDid = isKnownBusinessDid(called);
+  if (!calledIsDid) return false;
+
+  // Has start_stamp or call_flow or absence of duration
+  const hasStartStamp = !!(payload.start_stamp ?? payload.StartTime ?? payload.calldate);
+  const hasCallFlow = !!(payload.call_flow);
+  const hasNoDuration = !payload.duration && !payload.CallDuration && !payload.billsec;
+
+  return (hasStartStamp || hasCallFlow || hasNoDuration);
+}
+
+/**
  * Normalizes call status string into standard CRM enum.
  */
 function normalizeCallStatus(raw: string, payload?: SmartfloWebhookPayload): "answered" | "missed" | "busy" | "failed" | "no_answer" | "in_progress" | "unknown" {
@@ -121,6 +195,12 @@ function normalizeCallStatus(raw: string, payload?: SmartfloWebhookPayload): "an
   if (s.includes("no") && s.includes("answer")) return "no_answer";
   if (s.includes("fail") || s.includes("cancel")) return "failed";
   if (s.includes("progress") || s.includes("ring") || s.includes("received") || s.includes("initiat")) return "in_progress";
+
+  // Characteristic initial in-flight Smartflo webhook detection
+  if (payload && isInitialInboundProgressPayload(payload)) {
+    return "in_progress";
+  }
+
   return "unknown";
 }
 
@@ -163,6 +243,26 @@ function normalizeCallDirection(
     if (Array.isArray(payload.call_flow) && payload.call_flow.length > 0) {
       const flowStr = JSON.stringify(payload.call_flow).toLowerCase();
       if (flowStr.includes("click") || flowStr.includes("outbound")) return "outbound";
+    }
+
+    // Smartflo DID-based Inbound Detection:
+    // When explicit direction fields are missing, inspect caller and called numbers.
+    // If the called destination number matches our company business DID and caller is present, infer 'inbound'.
+    const calledNum = String(
+      payload.called_number ??
+      payload.call_to_number ??
+      payload.DestinationNumber ??
+      ""
+    ).trim();
+    const callerNum = String(
+      payload.caller_id_number ??
+      payload.caller_id ??
+      payload.SourceNumber ??
+      ""
+    ).trim();
+
+    if (calledNum && callerNum && isKnownBusinessDid(calledNum)) {
+      return "inbound";
     }
   }
 
@@ -282,8 +382,9 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   let rawCustomerPhone = "";
   if (direction === "inbound") {
     rawCustomerPhone = String(
-      payload.SourceNumber ??
       payload.caller_id_number ??
+      payload.caller_id ??
+      payload.SourceNumber ??
       payload.customer_number ??
       ""
     );
@@ -292,6 +393,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       payload.DestinationNumber ??
       payload.customer_number ??
       payload.call_to_number ??
+      payload.called_number ??
       payload.SourceNumber ??
       ""
     );
@@ -299,10 +401,12 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     // Missing or unknown direction: safely prioritize explicit customer_number, then SourceNumber, then DestinationNumber
     rawCustomerPhone = String(
       payload.customer_number ??
-      payload.SourceNumber ??
       payload.caller_id_number ??
+      payload.caller_id ??
+      payload.SourceNumber ??
       payload.DestinationNumber ??
       payload.call_to_number ??
+      payload.called_number ??
       ""
     );
   }
@@ -339,8 +443,15 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
 
   // 8. Agent and Display Number (sanitize to string, never allow [object Object])
   let agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
-  let agentNumber = String(payload.answered_agent_number ?? "").trim();
-  const callerDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? payload.caller_id ?? "").trim();
+  let agentNumber = String(payload.answered_agent_number ?? payload.agent_number ?? payload.agent_id ?? "").trim();
+  const callerDid = String(
+    payload.call_to_number ??
+    payload.called_number ??
+    payload.did ??
+    payload.DestinationNumber ??
+    payload.DisplayNumber ??
+    ""
+  ).trim();
 
   // Multi-Agent Correlation:
   // If agentName or agentNumber is missing or generic, correlate against User database by extension or Caller ID
