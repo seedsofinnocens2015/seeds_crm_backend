@@ -14,6 +14,7 @@ export interface ISmartfloCallLog extends Document {
   customerNumber: string;
   normalizedCustomerPhone: string;
   agentUserId?: mongoose.Types.ObjectId;
+  agentRung?: boolean;
   agentName?: string;
   agentNumber?: string;
   direction: "inbound" | "outbound" | "broadcast" | "unknown";
@@ -93,6 +94,11 @@ const SmartfloCallLogSchema = new Schema<ISmartfloCallLog>(
       type: Schema.Types.ObjectId,
       ref: "User",
       default: null,
+      index: true,
+    },
+    agentRung: {
+      type: Boolean,
+      default: false,
       index: true,
     },
     agentName: {

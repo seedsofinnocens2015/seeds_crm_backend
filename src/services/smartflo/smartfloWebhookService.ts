@@ -55,6 +55,10 @@ export interface SmartfloWebhookPayload {
   agent_name?: string;
   agent_id?: string;
   answered_agent_number?: string;
+  agent_extension?: string;
+  agent_number?: string;
+  extension?: string;
+  agents_answered_details?: Array<Record<string, any>>;
 
   // Recording URL aliases
   RecordingUrl?: string;
@@ -171,8 +175,9 @@ function normalizeCallStatus(raw: string, payload?: SmartfloWebhookPayload): "an
   ).toLowerCase().trim();
 
   // If payload contains explicit event trigger names from Smartflo:
-  // "Call received on Server" or "ringing" -> in_progress
+  // "Dialed on Agent", "Call received on Server" or "ringing" -> in_progress
   if (
+    eventIndicator.includes("dialed") ||
     eventIndicator.includes("received") ||
     eventIndicator.includes("server") ||
     eventIndicator.includes("ring") ||
@@ -303,6 +308,9 @@ function extractAgentName(rawAgent: any, payload?: SmartfloWebhookPayload): stri
         }
       }
     }
+    if (payload.agent_extension && typeof payload.agent_extension === "string" && payload.agent_extension.trim()) {
+      // Do not return raw extension as name unless candidate name not available
+    }
     if (payload.agent_name && typeof payload.agent_name === "string" && payload.agent_name.trim() && payload.agent_name.trim() !== "[object Object]") {
       return payload.agent_name.trim();
     }
@@ -373,9 +381,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
   const callId = String(rawCallId).trim();
 
-  // 2. Direction normalization
+  // Check existing SmartfloCallLog for this callId first to retain direction, agentUserId & correlation
+  const existingRecord = await SmartfloCallLog.findOne({ callId });
+  const isDuplicate = !!existingRecord;
+
+  // 2. Direction normalization (inherit from existingRecord if payload lacks explicit direction)
   const rawDirection = payload.Direction ?? payload.direction ?? payload.call_type ?? payload.callType ?? payload.type ?? "";
-  const direction = normalizeCallDirection(rawDirection, payload);
+  const directionCandidate = normalizeCallDirection(rawDirection, payload);
+  const direction = directionCandidate !== "unknown" ? directionCandidate : (existingRecord?.direction || "unknown");
 
   // 3. Customer phone extraction based on direction
   // - Inbound: SourceNumber is the calling customer; DestinationNumber is company DID.
@@ -443,13 +456,29 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const recordingUrl = typeof rawRecordingUrl === "string" ? rawRecordingUrl.trim() : "";
   const hasRecording = recordingUrl.length > 0;
 
-  // Check existing SmartfloCallLog for this callId first to retain agentUserId & correlation
-  const existingRecord = await SmartfloCallLog.findOne({ callId });
-  const isDuplicate = !!existingRecord;
-
   // 8. Agent and Display Number (sanitize to string, never allow [object Object])
   let agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
-  let agentNumber = String(payload.answered_agent_number ?? payload.agent_number ?? payload.agent_id ?? "").trim();
+  let agentNumber = String(
+    payload.answered_agent_number ??
+    payload.agent_number ??
+    payload.agent_extension ??
+    payload.extension ??
+    payload.agent_id ??
+    ""
+  ).trim();
+
+  // If agents_answered_details is present (e.g. Call Answered by Agent)
+  if (Array.isArray(payload.agents_answered_details) && payload.agents_answered_details.length > 0) {
+    const firstDetail = payload.agents_answered_details[0];
+    if (firstDetail && typeof firstDetail === "object") {
+      if (!agentName) {
+        agentName = String(firstDetail.name || firstDetail.agent_name || "").trim();
+      }
+      if (!agentNumber) {
+        agentNumber = String(firstDetail.extension || firstDetail.agent_number || firstDetail.id || "").trim();
+      }
+    }
+  }
   let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
   const callerDid = String(
     payload.call_to_number ??
@@ -509,10 +538,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
         }
       }
 
-      // 2. If not matched by DID and agent extension/id is present, try extension correlation
-      if (!matchedAgentUserId && agentNumber) {
+      // 2. If agent extension/number is present in payload, verify or correlate directly by extension
+      if (agentNumber) {
         const matchedByExt = await User.find({
-          $or: [{ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber }],
+          $or: [
+            { smartfloAgentId: agentNumber },
+            { smartfloAgentNumber: agentNumber },
+            { smartfloCallerId: agentNumber },
+          ],
           status: "active",
         }).select("_id name role smartfloAgentId smartfloAgentNumber smartfloCallerId");
 
@@ -522,6 +555,9 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
           if (!agentName || agentName === "Smartflo Dialer") {
             agentName = user.name;
           }
+          console.info(
+            `[Smartflo Webhook] Inbound call extension/agentNumber ${agentNumber} matched unique agent: ${user.name} (${user._id})`
+          );
         }
       }
     } else {
@@ -751,6 +787,22 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const finalAgentNumber = agentNumber || existingRecord?.agentNumber || "";
   const finalAgentUserId = matchedAgentUserId || existingRecord?.agentUserId || undefined;
 
+  // Check whether this payload confirms actual routing/delivery to an agent extension
+  // Smartflo triggers: "Dialed on Agent", explicit agent_extension, or presence of answered details/answer status
+  const eventName = String(
+    payload.event ?? payload.event_type ?? payload.trigger ?? payload.webhook_event ?? ""
+  ).toLowerCase().trim();
+
+  const isDialedOnAgent = eventName.includes("dialed") || eventName.includes("agent") && eventName.includes("dial");
+  const hasAgentExtension = !!(payload.agent_extension || payload.extension || payload.answered_agent_number || (payload.agent_number && payload.agent_number.length < 10));
+  const isAnsweredState = status === "answered" || eventName.includes("answered") || eventName.includes("picked");
+  const hadPriorAgentRung = !!existingRecord?.agentRung;
+
+  // An agent is confirmed rung/offered if this is a "Dialed on Agent" event,
+  // or if explicit agent extension metadata is present, or if it has reached answered state,
+  // or if an earlier webhook had already rung the agent extension.
+  const isAgentConfirmedRung = isDialedOnAgent || hasAgentExtension || isAnsweredState || hadPriorAgentRung;
+
   const updateData: Partial<ISmartfloCallLog> = {
     callId,
     uuid: String(payload.uuid || existingRecord?.uuid || ""),
@@ -758,6 +810,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     customerNumber,
     normalizedCustomerPhone: normalizedPhone,
     agentUserId: finalAgentUserId,
+    agentRung: isAgentConfirmedRung,
     agentName: finalAgentName,
     agentNumber: finalAgentNumber,
     direction,
@@ -889,15 +942,32 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
 
     const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
 
+    // Timing Synchronization Rule:
+    // 1. Initial "Call received on Server" or trunk-level payload has NOT yet been offered to an agent extension.
+    //    Suppress early ringing popup until "Dialed on Agent" or agent extension routing is confirmed.
+    // 2. When "Dialed on Agent" arrives (or agent extension confirmed), emit "inbound:ringing" to target agent.
+    // 3. When "Call Answered by Agent" (or Auto Answer) arrives, emit "inbound:answered" directly (or update popup).
+    // 4. If call was missed before ever being offered/rung to an agent, do NOT fire a ghost missed popup to agents.
     if (status === "in_progress") {
-      console.info(`[Smartflo Webhook] Emitting inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
-      broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
+      if (isAgentConfirmedRung && targetUserIdStr) {
+        console.info(`[Smartflo Webhook] Emitting synchronized inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr}`);
+        broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
+      } else {
+        console.info(
+          `[Smartflo Webhook] Suppressing early inbound:ringing popup for callId=${callId} (Call received on server; awaiting Dialed on Agent / extension routing).`
+        );
+      }
     } else if (status === "answered") {
       console.info(`[Smartflo Webhook] Emitting inbound:answered for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
       broadcastInboundCallEvent("inbound:answered", notificationPayload, targetUserIdStr);
     } else if (status === "missed") {
-      console.info(`[Smartflo Webhook] Emitting inbound:missed for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
-      broadcastInboundCallEvent("inbound:missed", notificationPayload, targetUserIdStr);
+      // Only emit missed popup to agent if the call was actually offered/rung to an agent
+      if (hadPriorAgentRung || isDialedOnAgent || targetUserIdStr) {
+        console.info(`[Smartflo Webhook] Emitting inbound:missed for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+        broadcastInboundCallEvent("inbound:missed", notificationPayload, targetUserIdStr);
+      } else {
+        console.info(`[Smartflo Webhook] Suppressed missed popup for callId=${callId} because call abandoned before routing to any agent.`);
+      }
     } else {
       console.info(`[Smartflo Webhook] Emitting inbound:ended for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
       broadcastInboundCallEvent("inbound:ended", notificationPayload, targetUserIdStr);

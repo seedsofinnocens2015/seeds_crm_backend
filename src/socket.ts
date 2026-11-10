@@ -130,6 +130,12 @@ export function getSocketServer(): SocketIOServer | null {
   return ioInstance;
 }
 
+let testEventInterceptor: ((event: string, data: any, targetUserId?: string) => void) | null = null;
+
+export function _setSocketTestInterceptor(interceptor: ((event: string, data: any, targetUserId?: string) => void) | null) {
+  testEventInterceptor = interceptor;
+}
+
 /**
  * Broadcasts an incoming or active call event to authenticated telephony agents.
  * If targetUserId is provided, the notification is routed strictly to that user's private room `user:<targetUserId>`.
@@ -140,6 +146,10 @@ export function broadcastInboundCallEvent(
   data: InboundCallNotification,
   targetUserId?: string
 ) {
+  if (testEventInterceptor) {
+    testEventInterceptor(event, data, targetUserId);
+  }
+
   if (!ioInstance) return;
 
   if (targetUserId) {
