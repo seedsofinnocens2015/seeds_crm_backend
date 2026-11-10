@@ -39,18 +39,8 @@ export async function getLeads(req: Request, res: Response) {
     const pageParam = req.query.page as string | undefined;
     const limitParam = req.query.limit as string | undefined;
 
-    // Agent scoping: restrict strictly by agent name
+    // Lead visibility: All authenticated CRM users (including agents) have full visibility across leads
     let query: any = {};
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim();
-      const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      query = {
-        $or: [
-          { callerName: { $regex: new RegExp(`^${escaped}$`, "i") } },
-          { leadOwner: { $regex: new RegExp(`^${escaped}$`, "i") } },
-        ],
-      };
-    }
 
     // Special lightweight view for dashboard calculations if requested
     if (view === "dashboard") {
@@ -174,18 +164,6 @@ export async function getLeadById(req: Request, res: Response) {
     const lead = await Lead.findOne(query).lean();
     if (!lead) {
       return res.status(404).json({ error: "Lead not found" });
-    }
-
-    // Role-based access control: agents can only view their own leads
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim().toLowerCase();
-      const leadCaller = (lead.callerName || "").trim().toLowerCase();
-      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
-      if (leadCaller !== agentName && leadOwner !== agentName) {
-        return res.status(403).json({
-          error: "Access denied. You can only view leads assigned to you.",
-        });
-      }
     }
 
     // Enrich real-time lead age
@@ -572,18 +550,6 @@ export async function updateLead(req: Request, res: Response) {
     const existingLead = await Lead.findOne(query);
     if (!existingLead) {
       return res.status(404).json({ error: "Lead not found" });
-    }
-
-    // Role check for agents
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim().toLowerCase();
-      const leadCaller = (existingLead.callerName || "").trim().toLowerCase();
-      const leadOwner = (existingLead.leadOwner || "").trim().toLowerCase();
-      if (leadCaller !== agentName && leadOwner !== agentName) {
-        return res.status(403).json({
-          error: "Access denied. You can only update leads assigned to you.",
-        });
-      }
     }
 
     // Handle Sub Status cascading

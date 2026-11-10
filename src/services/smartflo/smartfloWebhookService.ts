@@ -2,10 +2,12 @@ import mongoose from "mongoose";
 import { Lead, ILead } from "../../models/Lead.js";
 import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
+import { LeadCreationLock } from "../../models/LeadCreationLock.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
 import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
 import { config } from "../../config/env.js";
-import { SOURCE_NAME_TO_INFO } from "../../utils/dateUtils.js";
+import { SOURCE_NAME_TO_INFO, getFormattedTimestamp, getTodayDDMMMYY, getCurrentMonthMMMYY } from "../../utils/dateUtils.js";
+import { getNextUniqueId } from "../../utils/idGenerator.js";
 
 export interface SmartfloWebhookPayload {
   // Call ID aliases
@@ -444,6 +446,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   // 8. Agent and Display Number (sanitize to string, never allow [object Object])
   let agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
   let agentNumber = String(payload.answered_agent_number ?? payload.agent_number ?? payload.agent_id ?? "").trim();
+  let matchedAgentUserId: mongoose.Types.ObjectId | null = null;
   const callerDid = String(
     payload.call_to_number ??
     payload.called_number ??
@@ -454,40 +457,39 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   ).trim();
 
   // Multi-Agent Correlation:
-  // If agentName or agentNumber is missing or generic, correlate against User database by extension or Caller ID
-  if (!agentName || agentName === "Smartflo Dialer" || !agentNumber) {
-    try {
-      const userConditions: any[] = [];
-      if (agentNumber) {
-        userConditions.push({ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber });
-      }
-      if (callerDid) {
-        const cleanDid = callerDid.replace(/\D/g, "");
-        if (cleanDid.length >= 10) {
-          const tenDigit = cleanDid.slice(-10);
-          userConditions.push(
-            { smartfloCallerId: callerDid },
-            { smartfloCallerId: `+91${tenDigit}` },
-            { smartfloCallerId: `91${tenDigit}` },
-            { smartfloCallerId: tenDigit }
-          );
-        }
-      }
-
-      if (userConditions.length > 0) {
-        const matchedUser = await User.findOne({ $or: userConditions }).select("name smartfloAgentId smartfloAgentNumber smartfloCallerId");
-        if (matchedUser) {
-          if (!agentName || agentName === "Smartflo Dialer") {
-            agentName = matchedUser.name;
-          }
-          if (!agentNumber) {
-            agentNumber = matchedUser.smartfloAgentId || matchedUser.smartfloAgentNumber || "";
-          }
-        }
-      }
-    } catch (userLookupErr: any) {
-      // non-blocking
+  // Correlate against User database by extension or Caller ID to resolve actual User ObjectId and official name
+  try {
+    const userConditions: any[] = [];
+    if (agentNumber) {
+      userConditions.push({ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber });
     }
+    if (callerDid) {
+      const cleanDid = callerDid.replace(/\D/g, "");
+      if (cleanDid.length >= 10) {
+        const tenDigit = cleanDid.slice(-10);
+        userConditions.push(
+          { smartfloCallerId: callerDid },
+          { smartfloCallerId: `+91${tenDigit}` },
+          { smartfloCallerId: `91${tenDigit}` },
+          { smartfloCallerId: tenDigit }
+        );
+      }
+    }
+
+    if (userConditions.length > 0) {
+      const matchedUser = await User.findOne({ $or: userConditions }).select("_id name smartfloAgentId smartfloAgentNumber smartfloCallerId");
+      if (matchedUser) {
+        matchedAgentUserId = matchedUser._id as mongoose.Types.ObjectId;
+        if (!agentName || agentName === "Smartflo Dialer") {
+          agentName = matchedUser.name;
+        }
+        if (!agentNumber) {
+          agentNumber = matchedUser.smartfloAgentId || matchedUser.smartfloAgentNumber || "";
+        }
+      }
+    }
+  } catch (userLookupErr: any) {
+    // non-blocking
   }
 
   // 9. External CRM identifier passed back by dialer (custom parameter, custom_identifier, or explicit CRM id)
@@ -545,6 +547,128 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       console.warn(
         `[Smartflo Webhook] Ambiguous phone match for ${normalizedPhone}. Found ${candidateLeads.length} leads: ${candidateLeads.map((l) => l.uniqueId).join(", ")}. Flagging call for manual review.`
       );
+    }
+  }
+
+  // Step 1.5: Automatic Lead Creation for Inbound / Auto Dialer Calls from Unmatched Numbers
+  // If no lead exists for this customer phone, automatically create a new Lead record.
+  // Assign to the agent whose extension received the call, and prevent duplicate creation atomically via LeadCreationLock.
+  if (!matchedLead && matchingMethod !== "ambiguous" && normalizedPhone && normalizedPhone.length >= 10) {
+    let acquiredLock = false;
+    try {
+      // 1. Acquire distributed DB-level lock for this phone number
+      try {
+        await LeadCreationLock.create({ phone: normalizedPhone });
+        acquiredLock = true;
+      } catch (lockErr: any) {
+        // Lock already held by a simultaneous request. Wait slightly for the competitor to finish.
+        console.warn(`[Smartflo Webhook] Simultaneous lead creation in-flight for phone ${normalizedPhone}. Awaiting creation.`);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+
+      // 2. Check if lead now exists
+      const existingCheck = await Lead.findOne({
+        $or: [
+          { normalizedPhone: normalizedPhone },
+          { primaryMobileNumber: normalizedPhone },
+          { mobileNumber: normalizedPhone },
+        ],
+      });
+
+      if (existingCheck) {
+        matchedLead = existingCheck;
+        matchingMethod = "phone_primary";
+      } else if (acquiredLock) {
+        const assignedOwnerName = agentName || "Smartflo Dialer";
+        const autoUniqueId = await getNextUniqueId();
+        const todayDate = getTodayDDMMMYY();
+        const currentMonth = getCurrentMonthMMMYY();
+        const currentTimestamp = getFormattedTimestamp(new Date());
+
+        // Derive campaign/source from DID if available
+        const didClean = callerDid.replace(/\D/g, "");
+        const didTen = didClean.slice(-10);
+        const didInfo = SOURCE_NAME_TO_INFO[didTen] || SOURCE_NAME_TO_INFO[didClean] || null;
+
+        const callSource = direction === "broadcast" || payload.broadcast_campaign_details
+          ? "Smartflo Auto Dialer"
+          : "Inbound Call";
+
+        const newLeadDoc = await Lead.create({
+          uniqueId: autoUniqueId,
+          firstActivityDate: currentTimestamp,
+          primaryMobileNumber: customerNumber,
+          normalizedPhone: normalizedPhone,
+          wifeName: "Inbound Caller",
+          husbandName: "",
+          husbandAge: "28",
+          wifeAge: "26",
+          preMedicalConditions: "No",
+          marriedSince: "1",
+          tryingToConceiveYears: "1",
+          leadSource: didInfo?.source || callSource,
+          campaignName: didInfo?.campaignName || (payload.broadcast_campaign_details?.broadcast_campaign_name || "Smartflo Inbound"),
+          sourceName: callerDid || "Smartflo Pilot DID",
+          source: didInfo?.source || "Telephony",
+          subStatus: "Fresh Lead",
+          leadStage: "Fresh Lead",
+          leadValidStatus: "Valid",
+          centreLocation: "Noida Sector 62",
+          centreAddress: "Seeds IVF Centre",
+          leadOwner: assignedOwnerName,
+          callerName: assignedOwnerName,
+          createdBy: matchedAgentUserId,
+          notes: `Auto-created via ${callSource} received on DID ${callerDid || "Pilot"} assigned to extension ${agentNumber || "unassigned"}.`,
+          date: todayDate,
+          dateOfLead: todayDate,
+          month: currentMonth,
+          leadTimestamp: currentTimestamp,
+          assignedDate: todayDate,
+          assignedAt: new Date().toISOString(),
+          auditLogs: [
+            {
+              performedBy: assignedOwnerName,
+              performedByRole: "agent",
+              performedByEmail: "dialer@smartflo.crm",
+              timestamp: new Date().toISOString(),
+              changes: [
+                {
+                  field: "created",
+                  fieldLabel: "Auto Lead Creation",
+                  oldValue: "",
+                  newValue: `Lead auto-created from ${callSource} (${customerNumber}) assigned to ${assignedOwnerName}`,
+                },
+              ],
+            },
+          ],
+        });
+
+        matchedLead = newLeadDoc;
+        matchingMethod = "phone_primary";
+        console.info(
+          `[Smartflo Webhook] Auto-created new Lead ${autoUniqueId} for phone ${customerNumber} assigned to ${assignedOwnerName}`
+        );
+      }
+    } catch (createErr: any) {
+      console.warn(`[Smartflo Webhook] Auto lead creation conflict or notice: ${createErr.message}`);
+      const fallbackCheck = await Lead.findOne({
+        $or: [
+          { normalizedPhone: normalizedPhone },
+          { primaryMobileNumber: normalizedPhone },
+        ],
+      });
+      if (fallbackCheck) {
+        matchedLead = fallbackCheck;
+        matchingMethod = "phone_primary";
+      }
+    } finally {
+      if (acquiredLock) {
+        try {
+          await LeadCreationLock.deleteOne({ phone: normalizedPhone });
+        } catch (cleanupErr: any) {
+          // TTL index will auto-cleanup after 30s
+        }
+      }
     }
   }
 

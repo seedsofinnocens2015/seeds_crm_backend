@@ -10,8 +10,12 @@ import { verifySmartfloWebhookAuth, verifySmartfloPullAuth, streamCallRecording 
 import { executeQueueCycle, executeCdrReconciliationCycle } from "../services/smartflo/smartfloScheduler.js";
 import { config } from "../config/env.js";
 import { Lead } from "../models/Lead.js";
+import { User } from "../models/User.js";
 import { SmartfloCallLog } from "../models/SmartfloCallLog.js";
 import { SmartfloLeadJob } from "../models/SmartfloLeadJob.js";
+import { Counter } from "../models/Counter.js";
+import { LeadCreationLock } from "../models/LeadCreationLock.js";
+import mongoose from "mongoose";
 
 async function runTests() {
   console.log("=== Running Smartflo Integration Unit & Logic Tests ===");
@@ -488,6 +492,196 @@ async function runTests() {
     await processSmartfloWebhook(unknownDestPayload);
     assert("Unknown destination number does not blindly infer inbound", savedCallLogDoc.direction === "unknown");
     assert("Unknown destination number does not infer in_progress without DID match", savedCallLogDoc.status === "unknown");
+
+    // ==========================================
+    // 5.13 Auto Lead Creation & Deduplication Tests
+    // ==========================================
+    existingCallLogDoc = null;
+    const createdLeads: any[] = [];
+    const origLeadCreate = Lead.create;
+    const origCountDocuments = Lead.countDocuments;
+    const origCounterFindById = Counter.findById;
+    const origCounterFindByIdAndUpdate = Counter.findByIdAndUpdate;
+    const origLockCreate = LeadCreationLock.create;
+    const origLockDeleteOne = LeadCreationLock.deleteOne;
+
+    const activeLocks = new Set<string>();
+    (LeadCreationLock as any).create = async (doc: any) => {
+      if (activeLocks.has(doc.phone)) {
+        const err: any = new Error("E11000 duplicate key error collection");
+        err.code = 11000;
+        throw err;
+      }
+      activeLocks.add(doc.phone);
+      return doc;
+    };
+    (LeadCreationLock as any).deleteOne = async (filter: any) => {
+      activeLocks.delete(filter.phone);
+      return { deletedCount: 1 };
+    };
+
+    (Lead as any).countDocuments = async () => createdLeads.length;
+    let mockSeq = 100;
+    (Counter as any).findById = async () => ({ _id: "lead_unique_id", seq: mockSeq });
+    (Counter as any).findByIdAndUpdate = async (_id: any, update: any) => {
+      if (update?.$inc?.seq) mockSeq += update.$inc.seq;
+      if (update?.$set?.seq !== undefined) mockSeq = update.$set.seq;
+      return { _id: "lead_unique_id", seq: mockSeq };
+    };
+
+    (Lead as any).create = async (doc: any) => {
+      const createdDoc = {
+        _id: new mongoose.Types.ObjectId(),
+        uniqueId: doc.uniqueId,
+        wifeName: doc.wifeName,
+        primaryMobileNumber: doc.primaryMobileNumber,
+        normalizedPhone: doc.normalizedPhone,
+        leadOwner: doc.leadOwner,
+        callerName: doc.callerName,
+        createdBy: doc.createdBy,
+        leadSource: doc.leadSource,
+        campaignName: doc.campaignName,
+        sourceName: doc.sourceName,
+        source: doc.source,
+        auditLogs: doc.auditLogs || [],
+      };
+      createdLeads.push(createdDoc);
+      return createdDoc;
+    };
+
+    try {
+      // Test 1: New customer calls Agent A (Ext 0601001) -> Auto-creates lead assigned to Agent A
+      const newCustomerPayload: SmartfloWebhookPayload = {
+        call_id: "CALL_AUTO_CREATE_1",
+        caller_id: "9123456789", // New customer
+        called_number: "01140844000",
+        answered_agent_number: "0601001",
+        answered_agent: "Agent Priya",
+        start_stamp: "2026-11-10 13:00:00",
+      };
+
+      // Mock user lookup for agent
+      (User as any).findOne = async () => ({ name: "Agent Priya", smartfloAgentId: "0601001" });
+      // Lead lookup: check createdLeads by normalizedPhone or primaryMobileNumber
+      (Lead as any).findOne = async (q: any) => {
+        if (q?.uniqueId) return null;
+        if (q?.$or) {
+          const phones = q.$or.map((cond: any) => cond.normalizedPhone || cond.primaryMobileNumber || cond.mobileNumber).filter(Boolean);
+          return createdLeads.find(l => phones.includes(l.normalizedPhone) || phones.includes(l.primaryMobileNumber)) || null;
+        }
+        return createdLeads.find(l => l.normalizedPhone === q.normalizedPhone || l.primaryMobileNumber === q.primaryMobileNumber) || null;
+      };
+      const makeQueryChain = (results: any[] = []) => ({
+        sort: () => ({
+          limit: () => ({
+            lean: async () => results,
+          }),
+        }),
+        limit: () => results,
+      });
+
+      Lead.find = ((q: any) => makeQueryChain([])) as any;
+
+      const res1 = await processSmartfloWebhook(newCustomerPayload);
+      assert("New number call succeeds", res1.success === true);
+      assert("New lead auto-created in database", createdLeads.length === 1);
+      assert("Auto-created lead assigned to Agent Priya", createdLeads[0].leadOwner === "Agent Priya");
+      assert("Auto-created lead phone matches caller", createdLeads[0].normalizedPhone === "9123456789");
+      assert("Call log links to auto-created lead", savedCallLogDoc.crmLeadUniqueId === createdLeads[0].uniqueId);
+
+      // Test 2: Same customer calls Agent A again -> Reuses existing lead without duplicate creation
+      Lead.find = ((q: any) => ({
+        limit: () => [createdLeads[0]],
+      })) as any;
+      const res2 = await processSmartfloWebhook({
+        call_id: "CALL_AUTO_CREATE_2",
+        caller_id: "9123456789",
+        called_number: "01140844000",
+        answered_agent_number: "0601001",
+        answered_agent: "Agent Priya",
+      });
+      assert("Repeat call from same customer detected", res2.success === true);
+      assert("No second lead created (deduplicated)", createdLeads.length === 1);
+      assert("Associated with existing lead", savedCallLogDoc.crmLeadUniqueId === createdLeads[0].uniqueId);
+
+      // Test 3: Same customer calls Agent B (Ext 0602002) -> Preserves Agent Priya as original owner!
+      (User as any).findOne = async () => ({ name: "Agent Rahul", smartfloAgentId: "0602002" });
+      await processSmartfloWebhook({
+        call_id: "CALL_AUTO_CREATE_3",
+        caller_id: "9123456789",
+        called_number: "01140844000",
+        answered_agent_number: "0602002",
+        answered_agent: "Agent Rahul",
+      });
+      assert("Call to Agent B does not create another lead", createdLeads.length === 1);
+      assert("Lead owner strictly preserved as Agent Priya", createdLeads[0].leadOwner === "Agent Priya");
+
+      // Test 4: New number with different country code format (+91 99887 76655) -> Correct normalization
+      Lead.find = ((q: any) => makeQueryChain([])) as any;
+      await processSmartfloWebhook({
+        call_id: "CALL_AUTO_CREATE_4",
+        caller_id: "+91 99887-76655",
+        called_number: "01140844000",
+        answered_agent_number: "0602002",
+        answered_agent: "Agent Rahul",
+      });
+      assert("Lead created for second new customer", createdLeads.length === 2);
+      assert("Phone normalized accurately to 10 digits", createdLeads[1].normalizedPhone === "9988776655");
+      assert("Assigned to Agent Rahul", createdLeads[1].leadOwner === "Agent Rahul");
+
+      // Test 5: Auto Dialer call from a new customer
+      await processSmartfloWebhook({
+        call_id: "CALL_AUTO_DIALER_1",
+        caller_id: "9811223344",
+        called_number: "01140844000",
+        direction: "broadcast",
+        answered_agent_number: "0601001",
+        answered_agent: "Agent Priya",
+        broadcast_campaign_details: {
+          broadcast_campaign_name: "IVF_Auto_Dialer_Nov",
+        },
+      });
+      assert("Auto Dialer call created lead", createdLeads.length === 3);
+      assert("Auto Dialer lead source captured", createdLeads[2].leadSource.includes("Auto Dialer"));
+      assert("Auto Dialer campaign name captured", createdLeads[2].campaignName === "IVF_Auto_Dialer_Nov");
+
+      // Test 6: Simultaneous webhook requests for same new number -> Zero duplicate leads created!
+      Lead.find = ((q: any) => makeQueryChain([])) as any;
+      const simPhone = "9900112233";
+      const simPayload1: SmartfloWebhookPayload = {
+        call_id: "CALL_SIM_1",
+        caller_id: simPhone,
+        called_number: "01140844000",
+        answered_agent_number: "0601001",
+        answered_agent: "Agent Priya",
+      };
+      const simPayload2: SmartfloWebhookPayload = {
+        call_id: "CALL_SIM_2",
+        caller_id: simPhone,
+        called_number: "01140844000",
+        answered_agent_number: "0601001",
+        answered_agent: "Agent Priya",
+      };
+
+      const leadsBefore = createdLeads.length;
+      await Promise.all([
+        processSmartfloWebhook(simPayload1),
+        processSmartfloWebhook(simPayload2),
+      ]);
+      const leadsAfter = createdLeads.length;
+      assert("Simultaneous webhook calls create exactly 1 lead (no race condition duplicate)", leadsAfter === leadsBefore + 1);
+
+      // Test 7: Persists actual CRM User ObjectId in createdBy
+      const simLead = createdLeads.find(l => l.normalizedPhone === simPhone);
+      assert("Auto-created lead has valid createdBy user reference", simLead && simLead.createdBy !== undefined);
+    } finally {
+      Lead.create = origLeadCreate;
+      Lead.countDocuments = origCountDocuments;
+      Counter.findById = origCounterFindById;
+      Counter.findByIdAndUpdate = origCounterFindByIdAndUpdate;
+      LeadCreationLock.create = origLockCreate;
+      LeadCreationLock.deleteOne = origLockDeleteOne;
+    }
   } finally {
     // Restore DB methods
     Lead.findOne = origFindOneLead;

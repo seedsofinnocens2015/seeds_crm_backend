@@ -9,3 +9,4 @@ export * from "./MetaAdsSetupConfig.js";
 export * from "./MetaOAuthCodeAudit.js";
 export * from "./SmartfloLeadJob.js";
 export * from "./SmartfloCallLog.js";
+export * from "./LeadCreationLock.js";

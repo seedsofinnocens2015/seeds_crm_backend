@@ -75,13 +75,36 @@ async function syncCounterWithDatabase(): Promise<number> {
   return existingCounter.seq;
 }
 
+let isCounterInitialized = false;
+
+/**
+ * Ensures the Counter document exists and is initialized.
+ * Runs once upon first call or when explicitly invoked, avoiding expensive table scans on every lead creation.
+ */
+async function ensureCounterInitialized(): Promise<void> {
+  if (isCounterInitialized) return;
+
+  const existingCounter = await Counter.findById(COUNTER_ID);
+  if (!existingCounter) {
+    const actualMax = await getActualMaxLeadNumberFromDb();
+    await Counter.findByIdAndUpdate(
+      COUNTER_ID,
+      { $setOnInsert: { seq: actualMax } },
+      { upsert: true, new: true }
+    );
+  }
+  isCounterInitialized = true;
+}
+
 /**
  * Returns the current expected next unique ID WITHOUT incrementing the counter.
  * Safe for previews, GET requests, page loads, and refreshing.
  * If database is blank, preview will show SOI-1.
  */
 export async function peekNextUniqueId(): Promise<string> {
-  const currentSeq = await syncCounterWithDatabase();
+  await ensureCounterInitialized();
+  const counter = await Counter.findById(COUNTER_ID);
+  const currentSeq = counter?.seq ?? 0;
   return `SOI-${currentSeq + 1}`;
 }
 
@@ -91,7 +114,7 @@ export async function peekNextUniqueId(): Promise<string> {
  * Guarantees serial progression: SOI-1, SOI-2, SOI-3, etc.
  */
 export async function getNextUniqueId(): Promise<string> {
-  await syncCounterWithDatabase();
+  await ensureCounterInitialized();
 
   const counter = await Counter.findByIdAndUpdate(
     COUNTER_ID,
@@ -99,7 +122,7 @@ export async function getNextUniqueId(): Promise<string> {
     { new: true, upsert: true }
   );
 
-  return `SOI-${counter.seq}`;
+  return `SOI-${counter?.seq ?? 1}`;
 }
 
 /**

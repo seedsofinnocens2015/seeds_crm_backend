@@ -121,13 +121,9 @@ export async function getDashboardStats(req: Request, res: Response) {
       return res.status(200).json(cached.data);
     }
 
-    // Role-based scoping query
+    // Global lead visibility: All authenticated CRM members (admins, team leaders, agents, MIS, marketing)
+    // calculate dashboard metrics across the complete database of leads
     const query: any = {};
-    if (userRole === "agent") {
-      query.callerName = {
-        $regex: new RegExp(`^${userName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-      };
-    }
 
     // Minimal projection with only the necessary matrix fields (excludes heavy auditLogs and notesHistory)
     const leads = await Lead.find(query)

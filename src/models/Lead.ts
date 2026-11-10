@@ -476,13 +476,11 @@ const LeadSchema = new Schema<ILead>(
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
     normalizedAlternate: {
       type: String,
       default: "",
       trim: true,
-      index: true,
     },
 
     // Backwards Compatibility / Legacy Field Aliases
@@ -665,6 +663,8 @@ const LeadSchema = new Schema<ILead>(
 
 // High-Performance Query & Sorting Indexes
 LeadSchema.index({ createdAt: -1 });
+LeadSchema.index({ normalizedPhone: 1 }, { sparse: true });
+LeadSchema.index({ normalizedAlternate: 1 }, { sparse: true });
 LeadSchema.index({ leadOwner: 1, createdAt: -1 });
 LeadSchema.index({ callerName: 1, createdAt: -1 });
 LeadSchema.index({ centreLocation: 1 });
