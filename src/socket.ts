@@ -132,12 +132,23 @@ export function getSocketServer(): SocketIOServer | null {
 
 /**
  * Broadcasts an incoming or active call event to authenticated telephony agents.
+ * If targetUserId is provided, the notification is routed strictly to that user's private room `user:<targetUserId>`.
+ * If targetUserId is omitted, global broadcast to `telephony:inbound` is avoided to prevent unwanted popups for unrelated members.
  */
-export function broadcastInboundCallEvent(event: "inbound:ringing" | "inbound:answered" | "inbound:ended" | "inbound:missed", data: InboundCallNotification) {
+export function broadcastInboundCallEvent(
+  event: "inbound:ringing" | "inbound:answered" | "inbound:ended" | "inbound:missed",
+  data: InboundCallNotification,
+  targetUserId?: string
+) {
   if (!ioInstance) return;
 
-  // Broadcast to all active telephony agents & managers
-  ioInstance.to("telephony:inbound").emit(event, data);
+  if (targetUserId) {
+    ioInstance.to(`user:${targetUserId}`).emit(event, data);
+  } else {
+    // Unassigned or unmatched DID: do not broadcast popups globally to unrelated agents/admins.
+    // Log notice for monitoring and troubleshooting.
+    console.warn(`[Socket.IO] ${event} omitted global popup broadcast because target agent userId was not identified.`);
+  }
 }
 
 /**

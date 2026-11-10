@@ -443,10 +443,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const recordingUrl = typeof rawRecordingUrl === "string" ? rawRecordingUrl.trim() : "";
   const hasRecording = recordingUrl.length > 0;
 
+  // Check existing SmartfloCallLog for this callId first to retain agentUserId & correlation
+  const existingRecord = await SmartfloCallLog.findOne({ callId });
+  const isDuplicate = !!existingRecord;
+
   // 8. Agent and Display Number (sanitize to string, never allow [object Object])
   let agentName = extractAgentName(payload.answered_agent ?? payload.agent_name, payload);
   let agentNumber = String(payload.answered_agent_number ?? payload.agent_number ?? payload.agent_id ?? "").trim();
-  let matchedAgentUserId: mongoose.Types.ObjectId | null = null;
+  let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
   const callerDid = String(
     payload.call_to_number ??
     payload.called_number ??
@@ -456,40 +460,84 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     ""
   ).trim();
 
-  // Multi-Agent Correlation:
-  // Correlate against User database by extension or Caller ID to resolve actual User ObjectId and official name
+  // Multi-Agent Correlation by DID (smartfloCallerId) and Agent Extension:
+  // Correlate against User database to resolve actual User ObjectId and official name.
+  // DID-Based Routing Requirement:
+  // Inbound Smartflo popups are agent-specific based on the existing user field: "Assigned Outbound Caller ID / DID" (User.smartfloCallerId).
   try {
-    const userConditions: any[] = [];
-    if (agentNumber) {
-      userConditions.push({ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber });
-    }
-    if (callerDid) {
-      const cleanDid = callerDid.replace(/\D/g, "");
-      if (cleanDid.length >= 10) {
-        const tenDigit = cleanDid.slice(-10);
-        userConditions.push(
-          { smartfloCallerId: callerDid },
-          { smartfloCallerId: `+91${tenDigit}` },
-          { smartfloCallerId: `91${tenDigit}` },
-          { smartfloCallerId: tenDigit }
-        );
-      }
-    }
-
-    if (userConditions.length > 0) {
-      const matchedUser = await User.findOne({ $or: userConditions }).select("_id name smartfloAgentId smartfloAgentNumber smartfloCallerId");
-      if (matchedUser) {
-        matchedAgentUserId = matchedUser._id as mongoose.Types.ObjectId;
-        if (!agentName || agentName === "Smartflo Dialer") {
-          agentName = matchedUser.name;
+    if (!matchedAgentUserId) {
+      // 1. Try matching by called DID (smartfloCallerId)
+      if (callerDid) {
+        const cleanDid = callerDid.replace(/\D/g, "");
+        const didConditions: any[] = [{ smartfloCallerId: callerDid }];
+        if (cleanDid.length >= 8) {
+          didConditions.push({ smartfloCallerId: cleanDid });
+          const tenDigit = cleanDid.slice(-10);
+          didConditions.push(
+            { smartfloCallerId: `+91${tenDigit}` },
+            { smartfloCallerId: `91${tenDigit}` },
+            { smartfloCallerId: `0${tenDigit}` },
+            { smartfloCallerId: tenDigit }
+          );
         }
-        if (!agentNumber) {
-          agentNumber = matchedUser.smartfloAgentId || matchedUser.smartfloAgentNumber || "";
+
+        const matchedUsers = await User.find({
+          $or: didConditions,
+          status: "active",
+        }).select("_id name role smartfloAgentId smartfloAgentNumber smartfloCallerId");
+
+        if (matchedUsers.length === 1) {
+          const user = matchedUsers[0];
+          matchedAgentUserId = user._id as mongoose.Types.ObjectId;
+          if (!agentName || agentName === "Smartflo Dialer") {
+            agentName = user.name;
+          }
+          if (!agentNumber) {
+            agentNumber = user.smartfloAgentId || user.smartfloAgentNumber || "";
+          }
+          console.info(
+            `[Smartflo Webhook] Inbound call DID ${callerDid} matched unique agent: ${user.name} (${user._id})`
+          );
+        } else if (matchedUsers.length > 1) {
+          console.warn(
+            `[Smartflo Webhook] Ambiguous DID match: ${matchedUsers.length} active users share DID ${callerDid} (${matchedUsers.map((u) => u.name).join(", ")}). Omitted automatic single-agent assignment.`
+          );
+        } else {
+          console.info(
+            `[Smartflo Webhook] Inbound DID ${callerDid} did not match any active agent smartfloCallerId.`
+          );
+        }
+      }
+
+      // 2. If not matched by DID and agent extension/id is present, try extension correlation
+      if (!matchedAgentUserId && agentNumber) {
+        const matchedByExt = await User.find({
+          $or: [{ smartfloAgentId: agentNumber }, { smartfloAgentNumber: agentNumber }],
+          status: "active",
+        }).select("_id name role smartfloAgentId smartfloAgentNumber smartfloCallerId");
+
+        if (matchedByExt.length === 1) {
+          const user = matchedByExt[0];
+          matchedAgentUserId = user._id as mongoose.Types.ObjectId;
+          if (!agentName || agentName === "Smartflo Dialer") {
+            agentName = user.name;
+          }
+        }
+      }
+    } else {
+      // If agentUserId already saved on existing call log, fetch user details if agentName missing
+      if (!agentName || agentName === "Smartflo Dialer") {
+        const user = await User.findById(matchedAgentUserId).select("name smartfloAgentId smartfloAgentNumber");
+        if (user) {
+          agentName = user.name;
+          if (!agentNumber) {
+            agentNumber = user.smartfloAgentId || user.smartfloAgentNumber || "";
+          }
         }
       }
     }
   } catch (userLookupErr: any) {
-    // non-blocking
+    console.warn(`[Smartflo Webhook] User correlation lookup error: ${userLookupErr.message}`);
   }
 
   // 9. External CRM identifier passed back by dialer (custom parameter, custom_identifier, or explicit CRM id)
@@ -673,9 +721,6 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
 
   // Step 2: Upsert SmartfloCallLog with Idempotency Key (callId)
-  const existingRecord = await SmartfloCallLog.findOne({ callId });
-  const isDuplicate = !!existingRecord;
-
   // Status priority hierarchy to prevent terminal status regression from out-of-order webhooks
   const statusWeight: Record<string, number> = {
     unknown: 0,
@@ -704,6 +749,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const finalTotalDuration = totalDuration > 0 ? totalDuration : (existingRecord?.durationSeconds || 0);
   const finalAgentName = agentName || existingRecord?.agentName || "";
   const finalAgentNumber = agentNumber || existingRecord?.agentNumber || "";
+  const finalAgentUserId = matchedAgentUserId || existingRecord?.agentUserId || undefined;
 
   const updateData: Partial<ISmartfloCallLog> = {
     callId,
@@ -711,6 +757,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     refId: String(payload.ref_id || payload.refId || existingRecord?.refId || ""),
     customerNumber,
     normalizedCustomerPhone: normalizedPhone,
+    agentUserId: finalAgentUserId,
     agentName: finalAgentName,
     agentNumber: finalAgentNumber,
     direction,
@@ -840,18 +887,20 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
         : null,
     };
 
+    const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
+
     if (status === "in_progress") {
-      console.info(`[Smartflo Webhook] Emitting inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}`);
-      broadcastInboundCallEvent("inbound:ringing", notificationPayload);
+      console.info(`[Smartflo Webhook] Emitting inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+      broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
     } else if (status === "answered") {
-      console.info(`[Smartflo Webhook] Emitting inbound:answered for callId=${callId}, leadMatched=${!!matchedLead}`);
-      broadcastInboundCallEvent("inbound:answered", notificationPayload);
+      console.info(`[Smartflo Webhook] Emitting inbound:answered for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+      broadcastInboundCallEvent("inbound:answered", notificationPayload, targetUserIdStr);
     } else if (status === "missed") {
-      console.info(`[Smartflo Webhook] Emitting inbound:missed for callId=${callId}, leadMatched=${!!matchedLead}`);
-      broadcastInboundCallEvent("inbound:missed", notificationPayload);
+      console.info(`[Smartflo Webhook] Emitting inbound:missed for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+      broadcastInboundCallEvent("inbound:missed", notificationPayload, targetUserIdStr);
     } else {
-      console.info(`[Smartflo Webhook] Emitting inbound:ended for callId=${callId}, leadMatched=${!!matchedLead}`);
-      broadcastInboundCallEvent("inbound:ended", notificationPayload);
+      console.info(`[Smartflo Webhook] Emitting inbound:ended for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+      broadcastInboundCallEvent("inbound:ended", notificationPayload, targetUserIdStr);
     }
   } else {
     // Outbound Call Lifecycle Synchronization:

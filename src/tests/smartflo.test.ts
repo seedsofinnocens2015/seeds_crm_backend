@@ -269,8 +269,20 @@ async function runTests() {
   const origFindOneCall = SmartfloCallLog.findOne;
   const origFindOneAndUpdateCall = SmartfloCallLog.findOneAndUpdate;
   const origFindByIdAndUpdateLead = Lead.findByIdAndUpdate;
+  const origFindUser = User.find;
+  const origFindOneUser = User.findOne;
+  const origFindByIdUser = User.findById;
 
   try {
+    (User as any).find = () => ({
+      select: async () => [],
+    });
+    (User as any).findOne = () => ({
+      select: async () => null,
+    });
+    (User as any).findById = () => ({
+      select: async () => null,
+    });
     // 5.1 Missing Call ID Rejection
     let errorCaught = false;
     try {
@@ -674,6 +686,127 @@ async function runTests() {
       // Test 7: Persists actual CRM User ObjectId in createdBy
       const simLead = createdLeads.find(l => l.normalizedPhone === simPhone);
       assert("Auto-created lead has valid createdBy user reference", simLead && simLead.createdBy !== undefined);
+
+      // ==========================================
+      // 5.14 DID-Based Agent-Specific Incoming Call Popup Routing Tests
+      // ==========================================
+      const agent1Id = new mongoose.Types.ObjectId();
+      const agent2Id = new mongoose.Types.ObjectId();
+      const mockAgent1 = {
+        _id: agent1Id,
+        name: "Agent Neha",
+        role: "agent",
+        smartfloAgentId: "0608001",
+        smartfloAgentNumber: "0608001",
+        smartfloCallerId: "+911140844001",
+        status: "active",
+      };
+      const mockAgent2 = {
+        _id: agent2Id,
+        name: "Agent Rohan",
+        role: "agent",
+        smartfloAgentId: "0608002",
+        smartfloAgentNumber: "0608002",
+        smartfloCallerId: "+911140844002",
+        status: "active",
+      };
+
+      const mockUsers = [mockAgent1, mockAgent2];
+
+      (User as any).find = (query: any) => ({
+        select: async () => {
+          if (query?.$or) {
+            return mockUsers.filter(u => {
+              return query.$or.some((cond: any) => {
+                if (cond.smartfloCallerId && (
+                  cond.smartfloCallerId === u.smartfloCallerId ||
+                  u.smartfloCallerId.includes(cond.smartfloCallerId) ||
+                  cond.smartfloCallerId.includes(u.smartfloCallerId.replace(/\D/g, "").slice(-10))
+                )) return true;
+                if (cond.smartfloAgentId && (cond.smartfloAgentId === u.smartfloAgentId || cond.smartfloAgentId === u.smartfloAgentNumber)) return true;
+                return false;
+              });
+            });
+          }
+          return [];
+        },
+      });
+
+      (User as any).findById = (id: any) => ({
+        select: async () => mockUsers.find(u => u._id.toString() === id.toString()) || null,
+      });
+
+      // DID Test 1: Inbound call to Agent 1's DID -> Correlates to Agent 1 and persists agentUserId
+      existingCallLogDoc = null;
+      const agent1CallPayload: SmartfloWebhookPayload = {
+        call_id: "DID_ROUTING_CALL_1",
+        caller_id: "9876543210",
+        called_number: "01140844001", // Matches Agent 1 (+911140844001)
+        start_stamp: "2026-11-10 14:00:00",
+      };
+      const agent1Result = await processSmartfloWebhook(agent1CallPayload);
+      assert("Inbound call on Agent 1 DID routes to Agent 1", agent1Result.success === true);
+      assert("SmartfloCallLog stores agentUserId for Agent 1", savedCallLogDoc.agentUserId?.toString() === agent1Id.toString());
+      assert("Agent name resolved from User model as Agent Neha", savedCallLogDoc.agentName === "Agent Neha");
+
+      // DID Test 2: Inbound call to Agent 2's DID -> Correlates to Agent 2
+      existingCallLogDoc = null;
+      const agent2CallPayload: SmartfloWebhookPayload = {
+        call_id: "DID_ROUTING_CALL_2",
+        caller_id: "9876543210",
+        called_number: "+911140844002", // Matches Agent 2
+        start_stamp: "2026-11-10 14:01:00",
+      };
+      const agent2Result = await processSmartfloWebhook(agent2CallPayload);
+      assert("Inbound call on Agent 2 DID routes to Agent 2", agent2Result.success === true);
+      assert("SmartfloCallLog stores agentUserId for Agent 2", savedCallLogDoc.agentUserId?.toString() === agent2Id.toString());
+      assert("Agent name resolved from User model as Agent Rohan", savedCallLogDoc.agentName === "Agent Rohan");
+
+      // DID Test 3: Unmatched DID -> Omitted agentUserId, no arbitrary routing
+      existingCallLogDoc = null;
+      const unmatchedDidPayload: SmartfloWebhookPayload = {
+        call_id: "DID_ROUTING_UNMATCHED",
+        caller_id: "9876543210",
+        called_number: "01140844999", // Known trunk DID but not assigned to any single agent
+        start_stamp: "2026-11-10 14:02:00",
+      };
+      const unmatchedResult = await processSmartfloWebhook(unmatchedDidPayload);
+      assert("Unmatched DID webhook processes without crashing", unmatchedResult.success === true);
+      assert("Unmatched DID leaves agentUserId undefined", savedCallLogDoc.agentUserId === undefined);
+
+      // DID Test 4: Subsequent answered/ended webhook retains original agentUserId
+      existingCallLogDoc = {
+        callId: "DID_ROUTING_CALL_1",
+        agentUserId: agent1Id,
+        agentName: "Agent Neha",
+        status: "in_progress",
+      };
+      const answeredPayload: SmartfloWebhookPayload = {
+        call_id: "DID_ROUTING_CALL_1",
+        call_status: "answered",
+        duration: 35,
+      };
+      const answeredResult = await processSmartfloWebhook(answeredPayload);
+      assert("Subsequent answered webhook preserves original agentUserId", savedCallLogDoc.agentUserId?.toString() === agent1Id.toString());
+      assert("Subsequent answered webhook preserves original agentName", savedCallLogDoc.agentName === "Agent Neha");
+
+      // DID Test 5: Ambiguous DID assignment (2 users configured with same DID) -> Safe fallback
+      const duplicateDidUsers = [
+        { _id: new mongoose.Types.ObjectId(), name: "Agent X", smartfloCallerId: "01140844777", status: "active" },
+        { _id: new mongoose.Types.ObjectId(), name: "Agent Y", smartfloCallerId: "01140844777", status: "active" },
+      ];
+      (User as any).find = () => ({
+        select: async () => duplicateDidUsers,
+      });
+      existingCallLogDoc = null;
+      const ambiguousPayload: SmartfloWebhookPayload = {
+        call_id: "DID_AMBIGUOUS_CALL",
+        caller_id: "9876543210",
+        called_number: "01140844777",
+        start_stamp: "2026-11-10 14:05:00",
+      };
+      const ambiguousResult = await processSmartfloWebhook(ambiguousPayload);
+      assert("Ambiguous DID does not arbitrarily pick one user", savedCallLogDoc.agentUserId === undefined);
     } finally {
       Lead.create = origLeadCreate;
       Lead.countDocuments = origCountDocuments;
@@ -689,6 +822,9 @@ async function runTests() {
     SmartfloCallLog.findOne = origFindOneCall;
     SmartfloCallLog.findOneAndUpdate = origFindOneAndUpdateCall;
     Lead.findByIdAndUpdate = origFindByIdAndUpdateLead;
+    User.find = origFindUser;
+    User.findOne = origFindOneUser;
+    User.findById = origFindByIdUser;
   }
 
   // ==========================================

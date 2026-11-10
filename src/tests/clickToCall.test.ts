@@ -369,6 +369,19 @@ async function runClickToCallTests() {
       const origCallFindOne = SmartfloCallLog.findOne;
       const origCallFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
       const origLeadFindByIdAndUpdate = Lead.findByIdAndUpdate;
+      const origUserFind = User.find;
+      const origUserFindOne = User.findOne;
+      const origUserFindById2 = User.findById;
+
+      (User as any).find = () => ({
+        select: async () => [],
+      });
+      (User as any).findOne = () => ({
+        select: async () => null,
+      });
+      (User as any).findById = () => ({
+        select: async () => null,
+      });
 
       let savedUpdateDoc: any = null;
       let matchedLeadByUniqueId: any = null;
@@ -445,6 +458,9 @@ async function runClickToCallTests() {
       SmartfloCallLog.findOne = origCallFindOne;
       SmartfloCallLog.findOneAndUpdate = origCallFindOneAndUpdate;
       Lead.findByIdAndUpdate = origLeadFindByIdAndUpdate;
+      User.find = origUserFind;
+      User.findOne = origUserFindOne;
+      User.findById = origUserFindById2;
     }
 
     // ----------------------------------------------------
@@ -582,8 +598,20 @@ async function runClickToCallTests() {
       const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
       const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
       const origFindOneCallLog = SmartfloCallLog.findOne;
+      const origUserFind = User.find;
+      const origUserFindOne = User.findOne;
+      const origUserFindById = User.findById;
 
       try {
+        (User as any).find = () => ({
+          select: async () => [],
+        });
+        (User as any).findOne = () => ({
+          select: async () => null,
+        });
+        (User as any).findById = () => ({
+          select: async () => null,
+        });
         let savedCallData: any = null;
 
         (Lead as any).findOne = async () => ({
@@ -1046,8 +1074,20 @@ async function runClickToCallTests() {
       const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
       const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
       const origFindOneCallLog = SmartfloCallLog.findOne;
+      const origUserFind = User.find;
+      const origUserFindOne = User.findOne;
+      const origUserFindById = User.findById;
 
       try {
+        (User as any).find = () => ({
+          select: async () => [],
+        });
+        (User as any).findOne = () => ({
+          select: async () => null,
+        });
+        (User as any).findById = () => ({
+          select: async () => null,
+        });
         let loggedCall: any = null;
         (SmartfloCallLog as any).findOne = () => ({
           then: (res: any) => res(null),
