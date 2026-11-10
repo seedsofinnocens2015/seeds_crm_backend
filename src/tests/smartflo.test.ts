@@ -923,18 +923,47 @@ async function runTests() {
         assert("Direct Answer emits inbound:answered directly", emittedSocketEvents.some(e => e.event === "inbound:answered" && e.targetUserId === syncAgentId.toString()));
         assert("Direct Answer does not emit ringing popup", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
 
-        // Test Sync 5: Hangup event closes/updates call log
-        existingCallLogDoc = { ...savedCallLogDoc };
+        // Test Sync 5: Terminal Hangup payload containing call_status: "answered", duration: 45, billsec: 40, hangup_cause_description
+        // A) When popup was open (hadPriorAgentRung), emits inbound:ended to close popup; NEVER inbound:answered or inbound:ringing!
+        existingCallLogDoc = { ...savedCallLogDoc, agentRung: true, agentUserId: syncAgentId, direction: "inbound" };
         emittedSocketEvents.length = 0;
-        const hangupSyncPayload: SmartfloWebhookPayload = {
+        const actualTerminalHangupPayload: SmartfloWebhookPayload = {
+          event: "call_hangup",
           call_id: "SYNC_CALL_100",
-          event: "Call Hangup",
-          Status: "Answered",
-          duration: 40,
+          call_status: "answered",
+          direction: "inbound",
+          caller_id_number: "9876543210",
+          called_number: "01140844001",
+          duration: 45,
+          billsec: 40,
+          hangup_cause_description: "NORMAL_CLEARING",
         };
-        const hangupSyncResult = await processSmartfloWebhook(hangupSyncPayload);
-        assert("Hangup event updates existing record", hangupSyncResult.isDuplicate === true);
-        assert("Hangup preserves answered status and duration", savedCallLogDoc.durationSeconds === 40);
+        const terminalHangupResult = await processSmartfloWebhook(actualTerminalHangupPayload);
+        assert("Terminal Hangup with call_status 'answered' processes successfully", terminalHangupResult.success === true);
+        assert("Terminal Hangup preserves historical status 'answered' in DB", savedCallLogDoc.status === "answered");
+        assert("Terminal Hangup records duration (45s)", savedCallLogDoc.durationSeconds === 45);
+        assert("Terminal Hangup records answered duration (40s)", savedCallLogDoc.answeredDurationSeconds === 40);
+        assert("Terminal Hangup NEVER emits inbound:answered", emittedSocketEvents.filter(e => e.event === "inbound:answered").length === 0);
+        assert("Terminal Hangup NEVER emits inbound:ringing", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
+        assert("Terminal Hangup for active popup emits inbound:ended to target agent", emittedSocketEvents.some(e => e.event === "inbound:ended" && e.targetUserId === syncAgentId.toString()));
+
+        // B) When popup was never opened (agentRung is false), performs database log update ONLY and emits zero popups!
+        existingCallLogDoc = null;
+        emittedSocketEvents.length = 0;
+        const unannouncedHangupPayload: SmartfloWebhookPayload = {
+          event: "call_hangup",
+          call_id: "UNANNOUNCED_CALL_999",
+          call_status: "answered",
+          direction: "inbound",
+          caller_id_number: "9876543210",
+          called_number: "01140844001",
+          duration: 25,
+          billsec: 20,
+          hangup_cause_description: "NORMAL_CLEARING",
+        };
+        const unannouncedResult = await processSmartfloWebhook(unannouncedHangupPayload);
+        assert("Unannounced terminal hangup updates database log", unannouncedResult.success === true);
+        assert("Unannounced terminal hangup emits ZERO popups to agents", emittedSocketEvents.length === 0);
 
         // Test Sync 6: Missed call BEFORE agent routing -> Zero agent ringing popups
         existingCallLogDoc = null;

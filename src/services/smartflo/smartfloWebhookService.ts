@@ -787,19 +787,55 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const finalAgentNumber = agentNumber || existingRecord?.agentNumber || "";
   const finalAgentUserId = matchedAgentUserId || existingRecord?.agentUserId || undefined;
 
-  // Check whether this payload confirms actual routing/delivery to an agent extension
-  // Smartflo triggers: "Dialed on Agent", explicit agent_extension, or presence of answered details/answer status
+  // Check whether this payload represents a terminal call hangup / call ended event.
+  // Smartflo terminal indicators:
+  // - Event name: "call_hangup", "hangup", "call hangup", "completed", "ended", "call_ended", "call:ended"
+  // - Telephony indicators: hangup_cause, hangup_cause_code, hangup_cause_description
+  // - Durations: duration > 0, billsec > 0, CallDuration > 0
   const eventName = String(
     payload.event ?? payload.event_type ?? payload.trigger ?? payload.webhook_event ?? ""
   ).toLowerCase().trim();
 
-  const isDialedOnAgent = eventName.includes("dialed") || eventName.includes("agent") && eventName.includes("dial");
+  const rawHangupCause = String(
+    payload.hangup_cause ?? payload.hangup_cause_description ?? payload.hangup_cause_code ?? ""
+  ).trim();
+
+  const hasHangupEventName = (
+    eventName.includes("hangup") ||
+    eventName.includes("completed") ||
+    eventName.includes("ended") ||
+    eventName.includes("clearing") ||
+    eventName.includes("disconnect")
+  );
+
+  const hasHangupCause = (
+    rawHangupCause.length > 0 &&
+    rawHangupCause !== "0" &&
+    rawHangupCause.toLowerCase() !== "none"
+  );
+
+  const hasTerminalDuration = (
+    parseSafeDuration(payload.duration) > 0 ||
+    parseSafeDuration(payload.billsec) > 0 ||
+    parseSafeDuration(payload.CallDuration) > 0 ||
+    parseSafeDuration(payload.answered_duration) > 0
+  );
+
+  // A webhook is definitively terminal if it has hangup event name, hangup cause description,
+  // or terminal durations with an end timestamp or recording URL.
+  const isTerminalHangup = (
+    hasHangupEventName ||
+    hasHangupCause ||
+    (hasTerminalDuration && !!(payload.EndTime || payload.end_stamp || recordingUrl))
+  );
+
+  const isDialedOnAgent = eventName.includes("dialed") || (eventName.includes("agent") && eventName.includes("dial"));
   const hasAgentExtension = !!(payload.agent_extension || payload.extension || payload.answered_agent_number || (payload.agent_number && payload.agent_number.length < 10));
-  const isAnsweredState = status === "answered" || eventName.includes("answered") || eventName.includes("picked");
+  const isAnsweredState = (status === "answered" || eventName.includes("answered") || eventName.includes("picked")) && !isTerminalHangup;
   const hadPriorAgentRung = !!existingRecord?.agentRung;
 
   // An agent is confirmed rung/offered if this is a "Dialed on Agent" event,
-  // or if explicit agent extension metadata is present, or if it has reached answered state,
+  // or if explicit agent extension metadata is present, or if it has reached in-flight answered state,
   // or if an earlier webhook had already rung the agent extension.
   const isAgentConfirmedRung = isDialedOnAgent || hasAgentExtension || isAnsweredState || hadPriorAgentRung;
 
@@ -942,13 +978,32 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
 
     const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
 
-    // Timing Synchronization Rule:
-    // 1. Initial "Call received on Server" or trunk-level payload has NOT yet been offered to an agent extension.
+    // Timing Synchronization & Terminal Hangup Rules:
+    // 1. Terminal Call Hangup:
+    //    Smartflo sends a terminal hangup webhook containing call_status: "answered" with duration/billsec and hangup_cause.
+    //    A terminal hangup must NEVER emit "inbound:answered" or "inbound:ringing"!
+    //    - If the call was previously active/rung, emit "inbound:ended" strictly to close the open popup.
+    //    - If the popup was never opened, do NOT emit an active popup (log-only update).
+    // 2. Initial "Call received on Server":
     //    Suppress early ringing popup until "Dialed on Agent" or agent extension routing is confirmed.
-    // 2. When "Dialed on Agent" arrives (or agent extension confirmed), emit "inbound:ringing" to target agent.
-    // 3. When "Call Answered by Agent" (or Auto Answer) arrives, emit "inbound:answered" directly (or update popup).
-    // 4. If call was missed before ever being offered/rung to an agent, do NOT fire a ghost missed popup to agents.
-    if (status === "in_progress") {
+    // 3. "Dialed on Agent":
+    //    Emit "inbound:ringing" exclusively to the target agent's private room.
+    // 4. Genuine "Call Answered by Agent" (or in-flight Auto Answer):
+    //    Emit "inbound:answered" to update the popup to connected and start the call timer.
+    // 5. Missed calls before agent routing:
+    //    Do NOT fire ghost missed popups to agents.
+    if (isTerminalHangup) {
+      if (hadPriorAgentRung && targetUserIdStr) {
+        console.info(
+          `[Smartflo Webhook] Emitting inbound:ended on terminal hangup for active callId=${callId}, targetUser=${targetUserIdStr}`
+        );
+        broadcastInboundCallEvent("inbound:ended", { ...notificationPayload, status: "ended" }, targetUserIdStr);
+      } else {
+        console.info(
+          `[Smartflo Webhook] Terminal hangup recorded for callId=${callId} without prior agent ringing. Omitted UI popup emission.`
+        );
+      }
+    } else if (status === "in_progress") {
       if (isAgentConfirmedRung && targetUserIdStr) {
         console.info(`[Smartflo Webhook] Emitting synchronized inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr}`);
         broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
@@ -958,7 +1013,8 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
         );
       }
     } else if (status === "answered") {
-      console.info(`[Smartflo Webhook] Emitting inbound:answered for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
+      // Genuine live in-flight answer event only
+      console.info(`[Smartflo Webhook] Emitting inbound:answered for live callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr || "unassigned"}`);
       broadcastInboundCallEvent("inbound:answered", notificationPayload, targetUserIdStr);
     } else if (status === "missed") {
       // Only emit missed popup to agent if the call was actually offered/rung to an agent
