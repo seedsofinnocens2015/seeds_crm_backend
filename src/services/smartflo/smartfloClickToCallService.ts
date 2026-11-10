@@ -183,6 +183,7 @@ export async function initiateSmartfloClickToCall(
   if (returnedRefId) {
     try {
       const { SmartfloCallLog } = await import("../../models/SmartfloCallLog.js");
+      const agentUserId = (user as any)._id || (user as any).id || undefined;
       await SmartfloCallLog.findOneAndUpdate(
         { refId: returnedRefId },
         {
@@ -191,6 +192,7 @@ export async function initiateSmartfloClickToCall(
             refId: returnedRefId,
             customerNumber: destinationNumber,
             normalizedCustomerPhone: normalizedDigits,
+            agentUserId,
             agentName: user.name || "Agent",
             agentNumber: resolvedAgent,
             direction: "outbound",

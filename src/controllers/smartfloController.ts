@@ -5,7 +5,7 @@ import { Lead } from "../models/Lead.js";
 import { User } from "../models/User.js";
 import { SmartfloLeadJob } from "../models/SmartfloLeadJob.js";
 import { SmartfloCallLog } from "../models/SmartfloCallLog.js";
-import { broadcastCallEndedEvent } from "../socket.js";
+import { broadcastCallEndedEvent, broadcastOutboundCallEvent } from "../socket.js";
 import {
   processSmartfloWebhook,
   processSmartfloJob,
@@ -196,6 +196,7 @@ export async function getLeadCallHistory(req: Request, res: Response) {
       direction: c.direction && c.direction !== "unknown" ? c.direction : (c.refId ? "outbound" : "unknown"),
       status: c.status,
       customerNumber: c.customerNumber,
+      agentUserId: c.agentUserId ? c.agentUserId.toString() : undefined,
       agentName: resolveAgentName(c.agentName),
       durationSeconds: c.durationSeconds,
       answeredDurationSeconds: c.answeredDurationSeconds,
@@ -461,6 +462,24 @@ export async function handleClickToCall(req: Request, res: Response) {
       callTimeoutSeconds,
     });
 
+    // 5. Emit real-time outbound:initiating event to agent's private room
+    try {
+      broadcastOutboundCallEvent(
+        "outbound:initiating",
+        {
+          refId: result.refId,
+          leadId: lead._id?.toString(),
+          leadUniqueId: lead.uniqueId,
+          customerNumber: result.customerNumber,
+          status: "initiating",
+          timestamp: new Date().toISOString(),
+        },
+        session.id
+      );
+    } catch {
+      // non-blocking
+    }
+
     return res.status(200).json({
       status: "success",
       message: result.message,
@@ -518,6 +537,7 @@ export async function handleHangupCall(req: Request, res: Response) {
     }
 
     // 2. Role-based Access Control: agents can only hang up calls for leads assigned to them
+    let targetUserIdStr: string | undefined = session.id;
     if (session.role === "agent") {
       const agentName = (session.name || "").trim().toLowerCase();
       const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
@@ -533,15 +553,25 @@ export async function handleHangupCall(req: Request, res: Response) {
     // 3. If only refId is provided, check if SmartfloCallLog has already recorded an official callId
     let effectiveCallId = callId;
     let effectiveRefId = refId;
-    if (!effectiveCallId && effectiveRefId) {
-      try {
-        const existingLog = await SmartfloCallLog.findOne({ refId: effectiveRefId });
-        if (existingLog && existingLog.callId && !existingLog.callId.startsWith("C2C_PENDING_")) {
+    try {
+      const logQuery: any = {};
+      if (effectiveRefId) logQuery.refId = effectiveRefId;
+      else if (effectiveCallId) logQuery.callId = effectiveCallId;
+
+      const existingLog = await SmartfloCallLog.findOne(logQuery);
+      if (existingLog) {
+        if (!effectiveCallId && existingLog.callId && !existingLog.callId.startsWith("C2C_PENDING_")) {
           effectiveCallId = existingLog.callId;
         }
-      } catch (logLookupErr: any) {
-        // non-blocking fallback
+        if (!effectiveRefId && existingLog.refId) {
+          effectiveRefId = existingLog.refId;
+        }
+        if (existingLog.agentUserId) {
+          targetUserIdStr = existingLog.agentUserId.toString();
+        }
       }
+    } catch (logLookupErr: any) {
+      // non-blocking fallback
     }
 
     // 4. Dispatch Call Hangup request via dedicated service
@@ -550,18 +580,30 @@ export async function handleHangupCall(req: Request, res: Response) {
       callId: effectiveCallId,
     });
 
-    // 5. Emit real-time terminal event to clear active call states across CRM agents
-    try {
-      broadcastCallEndedEvent("outbound:ended", {
-        callId: effectiveCallId,
-        refId: effectiveRefId,
-        leadId: lead._id?.toString(),
-        leadUniqueId: lead.uniqueId,
-        status: "ended",
-        timestamp: new Date().toISOString(),
-      });
-    } catch {
-      // non-blocking
+    // 5. Lifecycle Synchronization:
+    // If Smartflo indicates the call was already terminated ("Call has already ended"),
+    // reconcile state immediately by emitting outbound:ended.
+    // If Smartflo accepted the hangup request for an in-flight call ("Call hangup request accepted"),
+    // the call is still disconnecting on the carrier switch; do NOT emit outbound:ended here.
+    // The official terminal Smartflo webhook (with hangup cause and billsec) will arrive shortly
+    // and broadcast the confirmed outbound:ended event.
+    if (result.message && result.message.includes("already ended")) {
+      try {
+        broadcastCallEndedEvent(
+          "outbound:ended",
+          {
+            callId: effectiveCallId,
+            refId: effectiveRefId,
+            leadId: lead._id?.toString(),
+            leadUniqueId: lead.uniqueId,
+            status: "ended",
+            timestamp: new Date().toISOString(),
+          },
+          targetUserIdStr
+        );
+      } catch {
+        // non-blocking
+      }
     }
 
     return res.status(200).json({

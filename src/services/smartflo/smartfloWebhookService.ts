@@ -4,7 +4,14 @@ import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { LeadCreationLock } from "../../models/LeadCreationLock.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
-import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
+import {
+  broadcastInboundCallEvent,
+  broadcastCallEndedEvent,
+  broadcastOutboundCallEvent,
+  InboundCallNotification,
+  CallEndedNotification,
+  OutboundCallNotification,
+} from "../../socket.js";
 import { config } from "../../config/env.js";
 import { SOURCE_NAME_TO_INFO, getFormattedTimestamp, getTodayDDMMMYY, getCurrentMonthMMMYY } from "../../utils/dateUtils.js";
 import { getNextUniqueId } from "../../utils/idGenerator.js";
@@ -1042,15 +1049,19 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     }
   } else {
     // Outbound Call Lifecycle Synchronization:
-    // When customer disconnects or call finishes (answered/completed/missed/failed),
-    // broadcast terminal events to clear active call states across CRM clients.
-    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status);
+    // Support outbound ringing, answered/connected, and terminal ended events.
+    const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
+    const outboundLeadId = matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined);
+    const outboundLeadUniqueId = matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined);
+
+    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status) && isTerminalHangup;
+
     if (isTerminal) {
       const callEndedPayload: CallEndedNotification = {
         callId,
         refId: updateData.refId || existingRecord?.refId || undefined,
-        leadId: matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined),
-        leadUniqueId: matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined),
+        leadId: outboundLeadId,
+        leadUniqueId: outboundLeadUniqueId,
         customerNumber,
         status: status === "answered" ? "answered" : status === "missed" ? "missed" : "ended",
         durationSeconds: finalTotalDuration,
@@ -1058,10 +1069,58 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       };
 
       console.info(
-        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}`
+        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
       );
-      broadcastCallEndedEvent("outbound:ended", callEndedPayload);
-      broadcastCallEndedEvent("call:ended", callEndedPayload);
+      broadcastCallEndedEvent("outbound:ended", callEndedPayload, targetUserIdStr);
+      broadcastCallEndedEvent("call:ended", callEndedPayload, targetUserIdStr);
+    } else if (status === "answered" && !isTerminalHangup) {
+      // In-flight answered: agent & customer connected
+      const answeredNotification: OutboundCallNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: outboundLeadId,
+        leadUniqueId: outboundLeadUniqueId,
+        customerNumber,
+        status: "answered",
+        durationSeconds: finalAnsweredDuration,
+        timestamp: (startTime || new Date()).toISOString(),
+      };
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:answered for connected callId=${callId}, refId=${answeredNotification.refId}, lead=${answeredNotification.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
+      );
+      broadcastOutboundCallEvent("outbound:answered", answeredNotification, targetUserIdStr);
+    } else if (status === "in_progress" || isDialedOnAgent) {
+      // Agent is ringing / waiting
+      const ringingNotification: OutboundCallNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: outboundLeadId,
+        leadUniqueId: outboundLeadUniqueId,
+        customerNumber,
+        status: "ringing",
+        timestamp: (startTime || new Date()).toISOString(),
+      };
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:ringing for callId=${callId}, refId=${ringingNotification.refId}, lead=${ringingNotification.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
+      );
+      broadcastOutboundCallEvent("outbound:ringing", ringingNotification, targetUserIdStr);
+    } else if (["missed", "failed", "busy", "no_answer"].includes(status)) {
+      // Unanswered or rejected outbound call
+      const failedPayload: CallEndedNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: outboundLeadId,
+        leadUniqueId: outboundLeadUniqueId,
+        customerNumber,
+        status: status === "missed" ? "missed" : "failed",
+        durationSeconds: finalTotalDuration,
+        timestamp: (endTime || new Date()).toISOString(),
+      };
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:ended (failed/missed) for callId=${callId}, lead=${failedPayload.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
+      );
+      broadcastCallEndedEvent("outbound:ended", failedPayload, targetUserIdStr);
+      broadcastCallEndedEvent("call:ended", failedPayload, targetUserIdStr);
     }
   }
 

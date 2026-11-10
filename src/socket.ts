@@ -161,6 +161,39 @@ export function broadcastInboundCallEvent(
   }
 }
 
+export interface OutboundCallNotification {
+  callId?: string;
+  refId?: string;
+  leadId?: string;
+  leadUniqueId?: string;
+  customerNumber?: string;
+  status: "initiating" | "ringing" | "answered" | "missed" | "ended" | "failed" | "completed";
+  durationSeconds?: number;
+  timestamp: string;
+}
+
+/**
+ * Broadcasts an outbound call lifecycle event to the target agent's private room.
+ */
+export function broadcastOutboundCallEvent(
+  event: "outbound:initiating" | "outbound:ringing" | "outbound:answered" | "outbound:ended" | "call:ended",
+  data: OutboundCallNotification,
+  targetUserId?: string
+) {
+  if (testEventInterceptor) {
+    testEventInterceptor(event, data, targetUserId);
+  }
+
+  if (!ioInstance) return;
+
+  if (targetUserId) {
+    ioInstance.to(`user:${targetUserId}`).emit(event, data);
+  } else {
+    // If targetUserId is unknown, broadcast to common telephony room
+    ioInstance.to("telephony:inbound").emit(event, data);
+  }
+}
+
 /**
  * Broadcasts an outbound or general call terminal event to authenticated telephony rooms.
  */
@@ -169,6 +202,10 @@ export function broadcastCallEndedEvent(
   data: CallEndedNotification,
   targetUserId?: string
 ) {
+  if (testEventInterceptor) {
+    testEventInterceptor(event, data, targetUserId);
+  }
+
   if (!ioInstance) return;
 
   // Always emit to general telephony room
