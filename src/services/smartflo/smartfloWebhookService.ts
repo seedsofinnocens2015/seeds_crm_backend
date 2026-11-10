@@ -834,10 +834,18 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   const isAnsweredState = (status === "answered" || eventName.includes("answered") || eventName.includes("picked")) && !isTerminalHangup;
   const hadPriorAgentRung = !!existingRecord?.agentRung;
 
-  // An agent is confirmed rung/offered if this is a "Dialed on Agent" event,
-  // or if explicit agent extension metadata is present, or if it has reached in-flight answered state,
-  // or if an earlier webhook had already rung the agent extension.
-  const isAgentConfirmedRung = isDialedOnAgent || hasAgentExtension || isAnsweredState || hadPriorAgentRung;
+  // In direct DID-to-agent architectures, Smartflo does not dispatch an intermediate "Dialed on Agent" webhook.
+  // When an inbound call arrives on a business DID that uniquely maps to an active CRM agent (matchedAgentUserId),
+  // that initial in-progress server event confirms immediate agent delivery/ringing.
+  const isDirectDidMatch = (status === "in_progress" && !!finalAgentUserId && direction === "inbound");
+
+  // An agent is confirmed rung/offered if:
+  // 1. Direct DID-to-agent mapping resolved a unique active CRM agent on the incoming call, OR
+  // 2. An explicit "Dialed on Agent" queue event was received, OR
+  // 3. Agent extension metadata is present, OR
+  // 4. In-flight answered state was reached, OR
+  // 5. An earlier webhook in this call already marked agentRung as true.
+  const isAgentConfirmedRung = isDirectDidMatch || isDialedOnAgent || hasAgentExtension || isAnsweredState || hadPriorAgentRung;
 
   const updateData: Partial<ISmartfloCallLog> = {
     callId,
@@ -1005,11 +1013,15 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       }
     } else if (status === "in_progress") {
       if (isAgentConfirmedRung && targetUserIdStr) {
-        console.info(`[Smartflo Webhook] Emitting synchronized inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr}`);
-        broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
+        if (!hadPriorAgentRung) {
+          console.info(`[Smartflo Webhook] Emitting synchronized inbound:ringing for callId=${callId}, leadMatched=${!!matchedLead}, targetUser=${targetUserIdStr}`);
+          broadcastInboundCallEvent("inbound:ringing", notificationPayload, targetUserIdStr);
+        } else {
+          console.info(`[Smartflo Webhook] Skipping duplicate inbound:ringing for already-rung callId=${callId}, targetUser=${targetUserIdStr}`);
+        }
       } else {
         console.info(
-          `[Smartflo Webhook] Suppressing early inbound:ringing popup for callId=${callId} (Call received on server; awaiting Dialed on Agent / extension routing).`
+          `[Smartflo Webhook] Suppressing early inbound:ringing popup for callId=${callId}: unassigned or ambiguous DID (awaiting agent routing).`
         );
       }
     } else if (status === "answered") {

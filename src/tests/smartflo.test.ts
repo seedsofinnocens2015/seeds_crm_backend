@@ -847,30 +847,55 @@ async function runTests() {
       });
 
       try {
-        // Test Sync 1: Initial "Call received on Server" initializes lead/metadata but SUPPRESSES early popup!
+        // Test Sync 1: Direct DID-to-agent mapping: Initial "Call received on Server" immediately emits inbound:ringing to target agent!
         existingCallLogDoc = null;
         emittedSocketEvents.length = 0;
         const initialServerPayload: SmartfloWebhookPayload = {
           call_id: "SYNC_CALL_100",
           event: "Call received on Server",
           caller_id: "9876543210",
-          called_number: "01140844001",
+          called_number: "01140844001", // Mapped directly to syncAgentId (Agent Neha)
           start_stamp: "2026-11-10 15:00:00",
         };
 
         const serverResult = await processSmartfloWebhook(initialServerPayload);
         assert("Initial server event processes successfully in background", serverResult.success === true);
         assert("Initial server event saves call metadata as in_progress", savedCallLogDoc.status === "in_progress");
-        assert("Initial server event suppresses early popup (0 ringing socket emissions)", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
+        assert("Direct DID match sets agentRung: true on initial server event", savedCallLogDoc.agentRung === true);
+        assert("Direct DID match immediately emits 1 inbound:ringing event", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 1);
+        const initialRinging = emittedSocketEvents.find(e => e.event === "inbound:ringing");
+        assert("Initial ringing emission targets strictly Agent Neha userId", initialRinging?.targetUserId === syncAgentId.toString());
 
-        // Test Sync 2: "Dialed on Agent" arrives -> Emits inbound:ringing strictly to target agent!
+        // Test Sync 1B: Duplicate retry of initial webhook does NOT emit duplicate ringing event
         existingCallLogDoc = { ...savedCallLogDoc };
         emittedSocketEvents.length = 0;
+        const retryResult = await processSmartfloWebhook(initialServerPayload);
+        assert("Duplicate webhook retry reports duplicate", retryResult.isDuplicate === true);
+        assert("Duplicate webhook retry does not emit duplicate ringing popup", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
+
+        // Test Sync 1C: Unassigned trunk DID suppresses popup completely
+        existingCallLogDoc = null;
+        emittedSocketEvents.length = 0;
+        const unassignedDidPayload: SmartfloWebhookPayload = {
+          call_id: "UNASSIGNED_CALL_555",
+          event: "Call received on Server",
+          caller_id: "9876543210",
+          called_number: "01140844999", // Trunk DID without assigned agent
+          start_stamp: "2026-11-10 15:00:00",
+        };
+        const unassignedResult = await processSmartfloWebhook(unassignedDidPayload);
+        assert("Unassigned DID call log is saved", unassignedResult.success === true);
+        assert("Unassigned DID call log has agentRung: false", savedCallLogDoc.agentRung === false);
+        assert("Unassigned DID call emits 0 ringing popups", emittedSocketEvents.length === 0);
+
+        // Test Sync 2: Queue flow / "Dialed on Agent" when arriving for unannounced call emits inbound:ringing
+        existingCallLogDoc = { ...savedCallLogDoc, agentRung: false };
+        emittedSocketEvents.length = 0;
         const dialedOnAgentPayload: SmartfloWebhookPayload = {
-          call_id: "SYNC_CALL_100",
+          call_id: "UNASSIGNED_CALL_555",
           event: "Dialed on Agent",
           caller_id: "9876543210",
-          called_number: "01140844001",
+          called_number: "01140844999",
           agent_extension: "0608001",
           agent_name: "Agent Neha",
           call_status: "ringing",
