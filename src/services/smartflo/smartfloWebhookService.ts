@@ -486,6 +486,21 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       }
     }
   }
+
+  // Also check call_flow array for Agent node if agentNumber or agentName is still missing
+  if ((!agentNumber || !agentName) && Array.isArray(payload.call_flow)) {
+    for (const step of payload.call_flow) {
+      if (step && typeof step === "object" && (step.type === "Agent" || step.type === "agent")) {
+        if (!agentNumber && (step.num || step.extension || step.number || step.id)) {
+          agentNumber = String(step.num || step.extension || step.number || step.id).trim();
+        }
+        if (!agentName && (step.name || step.agent_name)) {
+          agentName = String(step.name || step.agent_name).trim();
+        }
+        if (agentNumber && agentName) break;
+      }
+    }
+  }
   let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
   const callerDid = String(
     payload.call_to_number ??
@@ -545,14 +560,22 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
         }
       }
 
-      // 2. If agent extension/number is present in payload, verify or correlate directly by extension
-      if (agentNumber) {
+      // 2. If agent extension/number is present in payload or call_flow, verify or correlate directly by extension
+      const cleanAgentNumber = agentNumber.replace(/^Extension-/i, "").trim();
+      const extCandidates: string[] = [];
+      if (agentNumber) extCandidates.push(agentNumber);
+      if (cleanAgentNumber && cleanAgentNumber !== agentNumber) extCandidates.push(cleanAgentNumber);
+
+      if (extCandidates.length > 0) {
+        const extConditions: any[] = [];
+        for (const ext of extCandidates) {
+          extConditions.push({ smartfloAgentId: ext });
+          extConditions.push({ smartfloAgentNumber: ext });
+          extConditions.push({ smartfloCallerId: ext });
+        }
+
         const matchedByExt = await User.find({
-          $or: [
-            { smartfloAgentId: agentNumber },
-            { smartfloAgentNumber: agentNumber },
-            { smartfloCallerId: agentNumber },
-          ],
+          $or: extConditions,
           status: "active",
         }).select("_id name role smartfloAgentId smartfloAgentNumber smartfloCallerId");
 
