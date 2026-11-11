@@ -381,15 +381,54 @@ function parseSafeDate(raw: any): Date | undefined {
  * Idempotent, deduplicated, matches lead safely by external ID or normalized phone.
  */
 export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): Promise<WebhookProcessingResult> {
-  // 1. Call ID validation
-  const rawCallId = payload.CallSessionId ?? payload.call_id ?? payload.callId;
-  if (rawCallId === undefined || rawCallId === null || String(rawCallId).trim() === "") {
-    throw new Error("Missing mandatory 'call_id' in webhook payload.");
+  // 1. Call ID validation and verified alias resolution
+  // Smartflo provides call identifier through verified aliases:
+  // - call_id / CallSessionId / callId / callID
+  // - session_id / call_session_id / SessionId
+  // - uuid (Stable provider UUID when call_id template variable is unresolved or omitted)
+  const candidateId =
+    payload.call_id ??
+    payload.CallSessionId ??
+    payload.callId ??
+    payload.callID ??
+    payload.session_id ??
+    payload.call_session_id ??
+    payload.SessionId;
+
+  // Check if candidateId is a resolved string or number (not an un-interpolated template literal like "$call_id" or "")
+  const isResolvedIdentifier = (val: any): boolean => {
+    if (val === undefined || val === null) return false;
+    const str = String(val).trim();
+    if (!str || str.startsWith("$") || str.toLowerCase() === "undefined" || str.toLowerCase() === "null") {
+      return false;
+    }
+    return true;
+  };
+
+  let resolvedCallId = "";
+  if (isResolvedIdentifier(candidateId)) {
+    resolvedCallId = String(candidateId).trim();
+  } else if (isResolvedIdentifier(payload.uuid)) {
+    // Fallback to verified stable provider UUID if template variable $call_id was not populated by Smartflo
+    resolvedCallId = String(payload.uuid).trim();
   }
-  const callId = String(rawCallId).trim();
+
+  if (!resolvedCallId) {
+    const availableKeys = Object.keys(payload).filter((k) => isResolvedIdentifier(payload[k]));
+    throw new Error(
+      `Missing mandatory 'call_id' in webhook payload. Available keys with values: [${availableKeys.join(", ")}]`
+    );
+  }
+  const callId = resolvedCallId;
 
   // Check existing SmartfloCallLog for this callId first to retain direction, agentUserId & correlation
-  const existingRecord = await SmartfloCallLog.findOne({ callId });
+  // Also check by uuid or refId if previously linked
+  const existingRecord = await SmartfloCallLog.findOne({
+    $or: [
+      { callId },
+      ...(payload.uuid && isResolvedIdentifier(payload.uuid) ? [{ uuid: String(payload.uuid).trim() }] : []),
+    ],
+  });
   const isDuplicate = !!existingRecord;
 
   // 2. Direction normalization (inherit from existingRecord if payload lacks explicit direction)
@@ -401,36 +440,48 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   // - Inbound: SourceNumber is the calling customer; DestinationNumber is company DID.
   // - Outbound: DestinationNumber is the called customer; SourceNumber is agent/company DID.
   // - Unknown: Safely inspect customer_number first, then SourceNumber / DestinationNumber.
+  const cleanPhoneCandidate = (candidate: any): string => {
+    if (candidate === undefined || candidate === null) return "";
+    const str = String(candidate).trim();
+    if (!str || str.startsWith("$") || str.toLowerCase() === "undefined" || str.toLowerCase() === "null") {
+      return "";
+    }
+    return str;
+  };
+
   let rawCustomerPhone = "";
   if (direction === "inbound") {
-    rawCustomerPhone = String(
-      payload.caller_id_number ??
-      payload.caller_id ??
-      payload.SourceNumber ??
-      payload.customer_number ??
-      ""
-    );
+    rawCustomerPhone =
+      cleanPhoneCandidate(payload.caller_id_number) ||
+      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
+      cleanPhoneCandidate(payload["customer_no_with_prefix "]) ||
+      cleanPhoneCandidate(payload.customer_number_with_prefix) ||
+      cleanPhoneCandidate(payload.customer_number) ||
+      cleanPhoneCandidate(payload.caller_id) ||
+      cleanPhoneCandidate(payload.SourceNumber) ||
+      "";
   } else if (direction === "outbound") {
-    rawCustomerPhone = String(
-      payload.DestinationNumber ??
-      payload.customer_number ??
-      payload.call_to_number ??
-      payload.called_number ??
-      payload.SourceNumber ??
-      ""
-    );
+    rawCustomerPhone =
+      cleanPhoneCandidate(payload.DestinationNumber) ||
+      cleanPhoneCandidate(payload.customer_number) ||
+      cleanPhoneCandidate(payload.call_to_number) ||
+      cleanPhoneCandidate(payload.called_number) ||
+      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
+      cleanPhoneCandidate(payload.SourceNumber) ||
+      "";
   } else {
     // Missing or unknown direction: safely prioritize explicit customer_number, then SourceNumber, then DestinationNumber
-    rawCustomerPhone = String(
-      payload.customer_number ??
-      payload.caller_id_number ??
-      payload.caller_id ??
-      payload.SourceNumber ??
-      payload.DestinationNumber ??
-      payload.call_to_number ??
-      payload.called_number ??
-      ""
-    );
+    rawCustomerPhone =
+      cleanPhoneCandidate(payload.customer_number) ||
+      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
+      cleanPhoneCandidate(payload["customer_no_with_prefix "]) ||
+      cleanPhoneCandidate(payload.caller_id_number) ||
+      cleanPhoneCandidate(payload.caller_id) ||
+      cleanPhoneCandidate(payload.SourceNumber) ||
+      cleanPhoneCandidate(payload.DestinationNumber) ||
+      cleanPhoneCandidate(payload.call_to_number) ||
+      cleanPhoneCandidate(payload.called_number) ||
+      "";
   }
 
   const customerNumber = rawCustomerPhone.trim();
@@ -502,7 +553,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     }
   }
   let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
-  const callerDid = String(
+  const rawCallerDid = String(
     payload.call_to_number ??
     payload.called_number ??
     payload.did ??
@@ -510,6 +561,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     payload.DisplayNumber ??
     ""
   ).trim();
+  const callerDid = rawCallerDid.startsWith("$") ? "" : rawCallerDid;
 
   // Multi-Agent Correlation by DID (smartfloCallerId) and Agent Extension:
   // Correlate against User database to resolve actual User ObjectId and official name.

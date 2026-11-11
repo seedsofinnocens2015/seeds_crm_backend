@@ -57,10 +57,12 @@ export async function handleSmartfloWebhook(req: Request, res: Response) {
   const clientIp = req.ip || req.socket.remoteAddress;
   const rawAuthHeader = req.headers["authorization"] || req.headers["x-webhook-secret"] || req.headers["x-api-key"] || req.headers["secret"];
   const authHeaderPresent = !!rawAuthHeader;
+  const payload = req.body;
 
   // Safe request-entry logging (Never logs sensitive tokens, credentials, or caller numbers)
+  const incomingKeys = payload && typeof payload === "object" ? Object.keys(payload) : [];
   console.info(
-    `[Smartflo Webhook Entry] Received HTTP ${req.method} from IP=${clientIp}, authHeaderPresent=${authHeaderPresent}, contentType=${req.headers["content-type"] || "none"}`
+    `[Smartflo Webhook Entry] Received HTTP ${req.method} from IP=${clientIp}, authHeaderPresent=${authHeaderPresent}, contentType=${req.headers["content-type"] || "none"}, payloadKeys=[${incomingKeys.join(", ")}]`
   );
 
   try {
