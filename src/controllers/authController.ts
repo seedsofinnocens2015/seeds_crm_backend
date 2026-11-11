@@ -62,12 +62,16 @@ export async function login(req: Request, res: Response) {
       { expiresIn: "7d" }
     );
 
-    // Set secure HTTP-only cookie with cross-domain support in production
-    const isProd = config.nodeEnv === "production" || process.env.NODE_ENV === "production";
+    // Set secure HTTP-only cookie
+    // If request comes from localhost, don't pin domain to .seedsofinnocens.com so localhost can store cookie
+    const origin = req.headers.origin || "";
+    const isLocalhost = origin.includes("localhost") || origin.includes("127.0.0.1");
+    const isProd = (config.nodeEnv === "production" || process.env.NODE_ENV === "production") && !isLocalhost;
+
     res.cookie(COOKIE_NAME, token, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? "none" : "lax",
+      secure: true,
+      sameSite: "none",
       ...(isProd ? { domain: ".seedsofinnocens.com" } : {}),
       maxAge: SEVEN_DAYS_MS,
       path: "/",
@@ -159,11 +163,14 @@ export async function getMe(req: Request, res: Response) {
  * Clears authentication cookie.
  */
 export async function logout(req: Request, res: Response) {
-  const isProd = config.nodeEnv === "production" || process.env.NODE_ENV === "production";
+  const origin = req.headers.origin || "";
+  const isLocalhost = origin.includes("localhost") || origin.includes("127.0.0.1");
+  const isProd = (config.nodeEnv === "production" || process.env.NODE_ENV === "production") && !isLocalhost;
+
   res.clearCookie(COOKIE_NAME, {
     httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? "none" : "lax",
+    secure: true,
+    sameSite: "none",
     ...(isProd ? { domain: ".seedsofinnocens.com" } : {}),
     path: "/",
   });
