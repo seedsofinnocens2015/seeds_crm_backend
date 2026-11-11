@@ -4,7 +4,14 @@ import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { LeadCreationLock } from "../../models/LeadCreationLock.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
-import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
+import {
+  broadcastInboundCallEvent,
+  broadcastCallEndedEvent,
+  broadcastOutboundCallEvent,
+  InboundCallNotification,
+  CallEndedNotification,
+  OutboundCallNotification,
+} from "../../socket.js";
 import { config } from "../../config/env.js";
 import { SOURCE_NAME_TO_INFO, getFormattedTimestamp, getTodayDDMMMYY, getCurrentMonthMMMYY } from "../../utils/dateUtils.js";
 import { getNextUniqueId } from "../../utils/idGenerator.js";
@@ -898,11 +905,12 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   );
 
   // A webhook is definitively terminal if it has hangup event name, hangup cause description,
-  // or terminal durations with an end timestamp or recording URL.
+  // terminal durations (duration > 0 or billsec > 0), or terminal timestamps/recording URL.
   const isTerminalHangup = (
     hasHangupEventName ||
     hasHangupCause ||
-    (hasTerminalDuration && !!(payload.EndTime || payload.end_stamp || recordingUrl))
+    hasTerminalDuration ||
+    !!(payload.EndTime || payload.end_stamp)
   );
 
   const isDialedOnAgent = eventName.includes("dialed") || (eventName.includes("agent") && eventName.includes("dial"));
@@ -1031,6 +1039,8 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
 
   // Step 4: Real-Time Call Popups and Lifecycle Synchronization for CRM
+  const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
+
   if ((direction as string) === "inbound") {
     const calledDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? "");
     const leadDisplayName = matchedLead
@@ -1059,8 +1069,6 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
           }
         : null,
     };
-
-    const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
 
     // Timing Synchronization & Terminal Hangup Rules:
     // 1. Terminal Call Hangup:
@@ -1118,9 +1126,20 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     }
   } else {
     // Outbound Call Lifecycle Synchronization:
-    // When customer disconnects or call finishes (answered/completed/missed/failed),
-    // broadcast terminal events to clear active call states across CRM clients.
-    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status);
+    // Outbound state progression:
+    // 1. Terminal Call Hangup:
+    //    Smartflo sends a terminal hangup webhook (status: "answered", "completed", "ended", "missed", "failed", "busy", "no_answer")
+    //    accompanied by hangup indicators (hangup_cause, billsec, duration).
+    //    A terminal hangup must NEVER emit "outbound:answered" or "outbound:ringing"!
+    //    It must strictly emit "outbound:ended" and "call:ended" to reset the UI to IDLE.
+    // 2. Confirmed Outbound Ringing:
+    //    When status is "in_progress" or "ringing", and is NOT a terminal hangup.
+    //    Emits "outbound:ringing" to target agent room.
+    // 3. Live Non-Terminal Answered:
+    //    When status is "answered" and is NOT a terminal hangup (e.g. duration=0 or billsec=0 with no hangup_cause).
+    //    Emits "outbound:answered" to target agent room to transition UI to CONNECTED and start timer.
+    const isTerminal = isTerminalHangup || ["missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status);
+
     if (isTerminal) {
       const callEndedPayload: CallEndedNotification = {
         callId,
@@ -1134,10 +1153,41 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       };
 
       console.info(
-        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}`
+        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}, targetUser=${targetUserIdStr || "unassigned"}`
       );
-      broadcastCallEndedEvent("outbound:ended", callEndedPayload);
-      broadcastCallEndedEvent("call:ended", callEndedPayload);
+      broadcastCallEndedEvent("outbound:ended", callEndedPayload, targetUserIdStr);
+      broadcastCallEndedEvent("call:ended", callEndedPayload, targetUserIdStr);
+    } else if (status === "in_progress") {
+      const outboundRingingPayload: OutboundCallNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined),
+        leadUniqueId: matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined),
+        customerNumber,
+        status: "ringing",
+        timestamp: (startTime || new Date()).toISOString(),
+      };
+
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:ringing for callId=${callId}, refId=${outboundRingingPayload.refId}, targetUser=${targetUserIdStr || "unassigned"}`
+      );
+      broadcastOutboundCallEvent("outbound:ringing", outboundRingingPayload, targetUserIdStr);
+    } else if (status === "answered" && !isTerminalHangup) {
+      const outboundAnsweredPayload: OutboundCallNotification = {
+        callId,
+        refId: updateData.refId || existingRecord?.refId || undefined,
+        leadId: matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined),
+        leadUniqueId: matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined),
+        customerNumber,
+        status: "answered",
+        durationSeconds: finalAnsweredDuration,
+        timestamp: (startTime || new Date()).toISOString(),
+      };
+
+      console.info(
+        `[Smartflo Webhook] Emitting outbound:answered for live callId=${callId}, refId=${outboundAnsweredPayload.refId}, targetUser=${targetUserIdStr || "unassigned"}`
+      );
+      broadcastOutboundCallEvent("outbound:answered", outboundAnsweredPayload, targetUserIdStr);
     }
   }
 

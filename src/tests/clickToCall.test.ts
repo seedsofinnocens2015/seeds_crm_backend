@@ -2,7 +2,7 @@ import { initiateSmartfloClickToCall, _clearClickToCallDebounceMap } from "../se
 import { executeSmartfloCallHangup, _clearHangupDebounceMap } from "../services/smartflo/smartfloHangupService.js";
 import { handleClickToCall, handleHangupCall } from "../controllers/smartfloController.js";
 import { updateMySmartfloExtension } from "../controllers/authController.js";
-import { processSmartfloWebhook } from "../services/smartflo/smartfloWebhookService.js";
+import { processSmartfloWebhook, SmartfloWebhookPayload } from "../services/smartflo/smartfloWebhookService.js";
 import { config } from "../config/env.js";
 import { _setMockTokenCache, invalidateSmartfloAccessToken } from "../services/smartflo/smartfloAuthService.js";
 import { Lead } from "../models/Lead.js";
@@ -1300,6 +1300,165 @@ async function runClickToCallTests() {
       assert("Self-update persists extension ID", targetUpdateFields.smartfloAgentId === "0609999");
 
       User.findByIdAndUpdate = origUserFindByIdAndUpdate;
+    }
+
+    // -------------------------------------------------------------
+    // Test 14: Outbound Live Progression & Real-Time Socket Routing Tests
+    // -------------------------------------------------------------
+    {
+      const origFindOne = Lead.findOne;
+      const origFind = Lead.find;
+      const origFindByIdAndUpdate = Lead.findByIdAndUpdate;
+      const origFindOneAndUpdate = SmartfloCallLog.findOneAndUpdate;
+      const origFindOneCallLog = SmartfloCallLog.findOne;
+      const origUserFind = User.find;
+      const origUserFindById = User.findById;
+
+      const mockLead: any = {
+        _id: new mongoose.Types.ObjectId("6af43c2f666a1638869d9d61"),
+        uniqueId: "SOI-9001",
+        primaryMobileNumber: "9876543210",
+        normalizedPhone: "9876543210",
+        wifeName: "Ananya Sharma",
+        leadStage: "Follow Up",
+        leadOwner: "Agent Test",
+        callerName: "Agent Test",
+        auditLogs: [],
+      };
+
+      const testAgentId = new mongoose.Types.ObjectId("6af43c2f666a1638869d9d62");
+      const mockAgent = {
+        _id: testAgentId,
+        name: "Agent Test",
+        role: "agent",
+        smartfloAgentId: "060777",
+        smartfloAgentNumber: "060777",
+        smartfloCallerId: "+911140844777",
+        status: "active",
+      };
+
+      (Lead as any).findOne = () => Promise.resolve(mockLead);
+      (Lead as any).find = () => {
+        const queryPromise: any = Promise.resolve([mockLead]);
+        queryPromise.limit = () => Promise.resolve([mockLead]);
+        return queryPromise;
+      };
+      (Lead as any).findById = () => ({
+        select: () => Promise.resolve({ auditLogs: [] }),
+      });
+      (Lead as any).findByIdAndUpdate = () => Promise.resolve(mockLead);
+
+      let savedCallLogDoc: any = null;
+      (SmartfloCallLog as any).findOneAndUpdate = (_query: any, update: any) => {
+        savedCallLogDoc = { ...(update.$set || update), _id: new mongoose.Types.ObjectId() };
+        return Promise.resolve(savedCallLogDoc);
+      };
+
+      (User as any).find = () => ({
+        select: async () => [mockAgent],
+      });
+      (User as any).findById = () => ({
+        select: async () => mockAgent,
+      });
+
+      const emittedSocketEvents: Array<{ event: string; targetUserId?: string; data: any }> = [];
+      const { _setSocketTestInterceptor } = await import("../socket.js");
+      _setSocketTestInterceptor((event, data, targetUserId) => {
+        emittedSocketEvents.push({ event, targetUserId, data });
+      });
+
+      try {
+        // 1. Live confirmed outbound ringing webhook -> emits outbound:ringing
+        (SmartfloCallLog as any).findOne = () => Promise.resolve(null);
+        emittedSocketEvents.length = 0;
+
+        const liveRingingPayload: SmartfloWebhookPayload = {
+          call_id: "OUTBOUND_LIVE_1",
+          direction: "outbound",
+          Status: "in_progress",
+          DestinationNumber: "9876543210",
+          SourceNumber: "060777",
+          agent_extension: "060777",
+          ref_id: "REF_LIVE_1",
+          custom_identifier: { lead_unique_id: "SOI-9001" },
+        };
+
+        const ringingResult = await processSmartfloWebhook(liveRingingPayload);
+        assert("Live outbound ringing webhook processes successfully", ringingResult.success === true);
+        assert("Emits outbound:ringing event", emittedSocketEvents.some((e) => e.event === "outbound:ringing"));
+        const ringingEvt = emittedSocketEvents.find((e) => e.event === "outbound:ringing");
+        assert("Outbound ringing event is directed to agent private room", ringingEvt?.targetUserId === testAgentId.toString());
+        assert("Outbound ringing payload contains refId", ringingEvt?.data?.refId === "REF_LIVE_1");
+        assert("Outbound ringing status is 'ringing'", ringingEvt?.data?.status === "ringing");
+
+        // 2. Live confirmed outbound answered webhook -> emits outbound:answered (never terminal)
+        (SmartfloCallLog as any).findOne = () =>
+          Promise.resolve({
+            callId: "OUTBOUND_LIVE_1",
+            refId: "REF_LIVE_1",
+            agentUserId: testAgentId,
+            direction: "outbound",
+            status: "in_progress",
+          });
+        emittedSocketEvents.length = 0;
+
+        const liveAnsweredPayload: SmartfloWebhookPayload = {
+          call_id: "OUTBOUND_LIVE_1",
+          direction: "outbound",
+          event: "Call answered by Agent",
+          call_status: "answered",
+          DestinationNumber: "9876543210",
+          agent_extension: "060777",
+          ref_id: "REF_LIVE_1",
+          duration: 0,
+          billsec: 0,
+        };
+
+        const answeredResult = await processSmartfloWebhook(liveAnsweredPayload);
+        assert("Live outbound answered webhook processes successfully", answeredResult.success === true);
+        assert("Emits outbound:answered event", emittedSocketEvents.some((e) => e.event === "outbound:answered"));
+        assert("Does NOT emit outbound:ended on live answered event", !emittedSocketEvents.some((e) => e.event === "outbound:ended"));
+        const answeredEvt = emittedSocketEvents.find((e) => e.event === "outbound:answered");
+        assert("Outbound answered event is directed to agent private room", answeredEvt?.targetUserId === testAgentId.toString());
+        assert("Outbound answered status is 'answered'", answeredEvt?.data?.status === "answered");
+
+        // 3. Terminal hangup webhook with call_status 'answered' + billsec/hangup_cause
+        // Must emit outbound:ended and call:ended, and NEVER emit outbound:answered or outbound:ringing!
+        emittedSocketEvents.length = 0;
+        const terminalHangupPayload: SmartfloWebhookPayload = {
+          call_id: "OUTBOUND_LIVE_1",
+          direction: "outbound",
+          event: "call_hangup",
+          call_status: "answered",
+          DestinationNumber: "9876543210",
+          duration: 75,
+          billsec: 68,
+          hangup_cause_description: "NORMAL_CLEARING",
+          ref_id: "REF_LIVE_1",
+        };
+
+        const terminalResult = await processSmartfloWebhook(terminalHangupPayload);
+        assert("Terminal outbound hangup webhook processes successfully", terminalResult.success === true);
+        assert("Terminal hangup emits outbound:ended", emittedSocketEvents.some((e) => e.event === "outbound:ended"));
+        assert("Terminal hangup emits call:ended", emittedSocketEvents.some((e) => e.event === "call:ended"));
+        assert("Terminal hangup NEVER emits outbound:answered", !emittedSocketEvents.some((e) => e.event === "outbound:answered"));
+        assert("Terminal hangup NEVER emits outbound:ringing", !emittedSocketEvents.some((e) => e.event === "outbound:ringing"));
+
+        // 4. Duplicate terminal webhook does not emit duplicate active events
+        emittedSocketEvents.length = 0;
+        await processSmartfloWebhook(terminalHangupPayload);
+        assert("Duplicate terminal webhook does NOT emit outbound:answered", !emittedSocketEvents.some((e) => e.event === "outbound:answered"));
+      } finally {
+        _setSocketTestInterceptor(null);
+        Lead.findOne = origFindOne;
+        Lead.find = origFind;
+        Lead.findById = (origFindOne as any);
+        Lead.findByIdAndUpdate = origFindByIdAndUpdate;
+        SmartfloCallLog.findOneAndUpdate = origFindOneAndUpdate;
+        SmartfloCallLog.findOne = origFindOneCallLog;
+        User.find = origUserFind;
+        User.findById = origUserFindById;
+      }
     }
 
   } finally {

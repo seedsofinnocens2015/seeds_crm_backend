@@ -233,6 +233,7 @@ export async function getLeadCallHistory(req: Request, res: Response) {
       id: c._id,
       callId: c.callId,
       refId: c.refId || "",
+      agentUserId: c.agentUserId ? c.agentUserId.toString() : undefined,
       direction: c.direction && c.direction !== "unknown" ? c.direction : (c.refId ? "outbound" : "unknown"),
       status: c.status,
       customerNumber: c.customerNumber,
@@ -599,7 +600,7 @@ export async function handleHangupCall(req: Request, res: Response) {
         leadUniqueId: lead.uniqueId,
         status: "ended",
         timestamp: new Date().toISOString(),
-      });
+      }, session.id);
     } catch {
       // non-blocking
     }

@@ -39,6 +39,17 @@ export interface CallEndedNotification {
   timestamp: string;
 }
 
+export interface OutboundCallNotification {
+  callId?: string;
+  refId?: string;
+  leadId?: string;
+  leadUniqueId?: string;
+  customerNumber?: string;
+  status: "initiating" | "ringing" | "answered";
+  durationSeconds?: number;
+  timestamp: string;
+}
+
 /**
  * Initializes authenticated Socket.IO server mounted on the HTTP server.
  */
@@ -175,11 +186,33 @@ export function broadcastCallEndedEvent(
 
   if (!ioInstance) return;
 
-  // Always emit to general telephony room
-  ioInstance.to("telephony:inbound").emit(event, data);
-
-  // If agent/initiator userId is known, also emit directly to user's private room
+  // If agent/initiator userId is known, route strictly to user's private room to avoid global broadcast of call data
   if (targetUserId) {
     ioInstance.to(`user:${targetUserId}`).emit(event, data);
+  } else {
+    // If targetUserId is unknown, broadcast to authenticated telephony room
+    ioInstance.to("telephony:inbound").emit(event, data);
+  }
+}
+
+/**
+ * Broadcasts an outbound call progress event (initiating, ringing, answered) to the authenticated agent's private room.
+ */
+export function broadcastOutboundCallEvent(
+  event: "outbound:initiating" | "outbound:ringing" | "outbound:answered",
+  data: OutboundCallNotification,
+  targetUserId?: string
+) {
+  if (testEventInterceptor) {
+    testEventInterceptor(event, data, targetUserId);
+  }
+
+  if (!ioInstance) return;
+
+  if (targetUserId) {
+    ioInstance.to(`user:${targetUserId}`).emit(event, data);
+  } else {
+    // In multi-agent environment, do not broadcast sensitive outbound ringing/answered data globally
+    console.info(`[Socket.IO] ${event} omitted global broadcast because target agent userId was not identified.`);
   }
 }
