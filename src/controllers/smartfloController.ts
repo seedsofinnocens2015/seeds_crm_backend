@@ -435,18 +435,10 @@ export async function handleClickToCall(req: Request, res: Response) {
       return res.status(404).json({ error: "Lead not found." });
     }
 
-    // 2. Role-based Access Control: agents can only call their assigned leads
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim().toLowerCase();
-      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
-      const callerName = (lead.callerName || "").trim().toLowerCase();
-
-      if (leadOwner !== agentName && callerName !== agentName) {
-        return res.status(403).json({
-          error: "Access denied. You can only initiate calls to leads assigned to you.",
-        });
-      }
-    }
+    // 2. Global Lead Visibility Policy:
+    // In Seeds CRM, leads are globally visible to all authenticated CRM staff.
+    // Agents, team leaders, and admins can initiate click-to-call on any visible lead in the system.
+    // Call activities are audited with the initiating agent's identity and extension.
 
     // 3. Resolve User record for Smartflo telephony configuration
     const user = await User.findById(session.id);
@@ -536,42 +528,54 @@ export async function handleHangupCall(req: Request, res: Response) {
       return res.status(404).json({ error: "Lead not found." });
     }
 
-    // 2. Role-based Access Control: agents can only hang up calls for leads assigned to them
+    // 2. Resolve Active Call Log to verify ownership and identify call identifiers
+    let effectiveCallId = callId;
+    let effectiveRefId = refId;
     let targetUserIdStr: string | undefined = session.id;
-    if (session.role === "agent") {
-      const agentName = (session.name || "").trim().toLowerCase();
-      const leadOwner = (lead.leadOwner || "").trim().toLowerCase();
-      const callerName = (lead.callerName || "").trim().toLowerCase();
 
-      if (leadOwner !== agentName && callerName !== agentName) {
-        return res.status(403).json({
-          error: "Access denied. You can only manage calls for leads assigned to you.",
-        });
+    const logQuery: any = { $or: [] };
+    if (effectiveRefId) logQuery.$or.push({ refId: effectiveRefId });
+    if (effectiveCallId) logQuery.$or.push({ callId: effectiveCallId });
+    if (lead._id) logQuery.$or.push({ crmLeadId: lead._id });
+    if (lead.uniqueId) logQuery.$or.push({ crmLeadUniqueId: lead.uniqueId });
+
+    let existingLog = null;
+    if (logQuery.$or.length > 0) {
+      existingLog = await SmartfloCallLog.findOne(logQuery).sort({ createdAt: -1 });
+    }
+
+    if (existingLog) {
+      if (!effectiveCallId && existingLog.callId && !existingLog.callId.startsWith("C2C_PENDING_")) {
+        effectiveCallId = existingLog.callId;
+      }
+      if (!effectiveRefId && existingLog.refId) {
+        effectiveRefId = existingLog.refId;
+      }
+      if (existingLog.agentUserId) {
+        targetUserIdStr = existingLog.agentUserId.toString();
       }
     }
 
-    // 3. If only refId is provided, check if SmartfloCallLog has already recorded an official callId
-    let effectiveCallId = callId;
-    let effectiveRefId = refId;
-    try {
-      const logQuery: any = {};
-      if (effectiveRefId) logQuery.refId = effectiveRefId;
-      else if (effectiveCallId) logQuery.callId = effectiveCallId;
+    // Hangup Authorization Rules:
+    // Allow Hangup only for:
+    // - The authenticated user who initiated the active call (SmartfloCallLog.agentUserId matches session.id)
+    // - Authorized Admin, Super Admin, or Team Leader according to role permissions
+    // - If no call log exists yet, allow if session.id initiated or user is manager/admin
+    const isManagerOrAdmin = ["admin", "super_admin", "team_leader"].includes(session.role);
+    const isCallInitiator = existingLog?.agentUserId
+      ? existingLog.agentUserId.toString() === session.id
+      : true; // fallback if log not yet synced
 
-      const existingLog = await SmartfloCallLog.findOne(logQuery);
-      if (existingLog) {
-        if (!effectiveCallId && existingLog.callId && !existingLog.callId.startsWith("C2C_PENDING_")) {
-          effectiveCallId = existingLog.callId;
-        }
-        if (!effectiveRefId && existingLog.refId) {
-          effectiveRefId = existingLog.refId;
-        }
-        if (existingLog.agentUserId) {
-          targetUserIdStr = existingLog.agentUserId.toString();
-        }
-      }
-    } catch (logLookupErr: any) {
-      // non-blocking fallback
+    if (session.role === "agent" && !isCallInitiator) {
+      return res.status(403).json({
+        error: "Access denied. You can only terminate calls that you initiated.",
+      });
+    }
+
+    if (!effectiveRefId && !effectiveCallId) {
+      return res.status(400).json({
+        error: "Missing active call identifier. Call may have already concluded.",
+      });
     }
 
     // 4. Dispatch Call Hangup request via dedicated service
