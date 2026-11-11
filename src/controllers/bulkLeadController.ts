@@ -104,50 +104,66 @@ export async function bulkUploadLeads(req: Request, res: Response) {
       return res.status(400).json({ error: "No leads data provided in payload" });
     }
 
-    // Enforce reasonable batch-size limit (max 5,000 per request)
-    if (leads.length > 5000) {
+    // Enforce batch-size limit (max 10,000 per request)
+    if (leads.length > 10000) {
       return res.status(400).json({
-        error: "Batch limit exceeded. Maximum 5,000 leads can be uploaded per batch.",
+        error: "Batch limit exceeded. Maximum 10,000 leads can be uploaded per batch.",
       });
     }
 
-    // 1. Gather all incoming normalized phone numbers
+    // 1. Gather all incoming normalized Primary and Secondary mobile numbers strictly
     const incomingMobiles = new Set<string>();
     for (const item of leads) {
-      const rawMob = String(item.mobileNumber || item.phoneNumber || "");
-      const norm = normalizePhoneNumber(rawMob);
-      if (norm) {
-        incomingMobiles.add(norm);
-      } else {
-        const clean = rawMob.replace(/\D/g, "").slice(-10);
-        if (clean && clean.length >= 10) incomingMobiles.add(clean);
+      // Primary Mobile
+      const rawPrimary = String(item.primaryMobileNumber || item.mobileNumber || item.phoneNumber || "").trim();
+      const cleanPrimary = rawPrimary.replace(/\D/g, "").slice(-10);
+      if (cleanPrimary && cleanPrimary.length === 10) {
+        incomingMobiles.add(cleanPrimary);
+        const norm = normalizePhoneNumber(rawPrimary);
+        if (norm) incomingMobiles.add(norm);
+      }
+
+      // Secondary Mobile
+      const rawSecondary = String(item.secondaryMobileNumber || item.alternateNumber || "").trim();
+      const cleanSecondary = rawSecondary.replace(/\D/g, "").slice(-10);
+      if (cleanSecondary && cleanSecondary.length === 10) {
+        incomingMobiles.add(cleanSecondary);
+        const norm = normalizePhoneNumber(rawSecondary);
+        if (norm) incomingMobiles.add(norm);
       }
     }
 
-    // 2. Find and remove old matching duplicate leads from the database
+    // 2. Find and remove old matching duplicate leads from the database based on Primary / Secondary phone
     let deletedCount = 0;
-    const existingMatchesByMobile: Record<string, string> = {}; // norm -> old uniqueId
+    const existingMatchesByMobile: Record<string, string> = {}; // 10-digit clean phone -> old uniqueId
 
     if (incomingMobiles.size > 0) {
       const mobArray = Array.from(incomingMobiles);
       const oldDuplicates = await Lead.find(
         {
           $or: [
+            { primaryMobileNumber: { $in: mobArray } },
+            { secondaryMobileNumber: { $in: mobArray } },
             { normalizedPhone: { $in: mobArray } },
             { normalizedAlternate: { $in: mobArray } },
             { mobileNumber: { $in: mobArray } },
             { phoneNumber: { $in: mobArray } },
+            { alternateNumber: { $in: mobArray } },
           ],
         },
-        { _id: 1, uniqueId: 1, mobileNumber: 1, phoneNumber: 1, normalizedPhone: 1 }
+        { _id: 1, uniqueId: 1, primaryMobileNumber: 1, secondaryMobileNumber: 1, mobileNumber: 1, phoneNumber: 1, normalizedPhone: 1 }
       ).lean();
 
       if (oldDuplicates.length > 0) {
         const idsToDelete = oldDuplicates.map((d: any) => d._id);
         for (const d of oldDuplicates) {
-          const normKey = d.normalizedPhone || String(d.mobileNumber || d.phoneNumber || "").replace(/\D/g, "").slice(-10);
-          if (normKey && !existingMatchesByMobile[normKey] && d.uniqueId) {
-            existingMatchesByMobile[normKey] = d.uniqueId;
+          const p = String(d.primaryMobileNumber || d.mobileNumber || d.phoneNumber || "").replace(/\D/g, "").slice(-10);
+          const s = String(d.secondaryMobileNumber || "").replace(/\D/g, "").slice(-10);
+          if (p && p.length === 10 && !existingMatchesByMobile[p] && d.uniqueId) {
+            existingMatchesByMobile[p] = d.uniqueId;
+          }
+          if (s && s.length === 10 && !existingMatchesByMobile[s] && d.uniqueId) {
+            existingMatchesByMobile[s] = d.uniqueId;
           }
         }
         const delRes = await Lead.deleteMany({ _id: { $in: idsToDelete } });

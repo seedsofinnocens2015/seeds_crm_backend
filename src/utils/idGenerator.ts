@@ -74,17 +74,26 @@ let isCounterInitialized = false;
 
 /**
  * Ensures the Counter document exists and is initialized.
- * Runs once upon first call or when explicitly invoked, avoiding expensive table scans on every lead creation.
+ * If database is blank (0 leads), resets Counter seq to 0 so the first lead is SOI-1.
  */
 async function ensureCounterInitialized(): Promise<void> {
-  if (isCounterInitialized) return;
-
-  const existingCounter = await Counter.findById(COUNTER_ID);
-  if (!existingCounter) {
-    const actualMax = await getActualMaxLeadNumberFromDb();
+  const actualMax = await getActualMaxLeadNumberFromDb();
+  
+  if (actualMax === 0) {
     await Counter.findByIdAndUpdate(
       COUNTER_ID,
-      { $setOnInsert: { seq: actualMax } },
+      { $set: { seq: 0 } },
+      { upsert: true, new: true }
+    );
+    isCounterInitialized = true;
+    return;
+  }
+
+  const existingCounter = await Counter.findById(COUNTER_ID);
+  if (!existingCounter || existingCounter.seq < actualMax) {
+    await Counter.findByIdAndUpdate(
+      COUNTER_ID,
+      { $set: { seq: actualMax } },
       { upsert: true, new: true }
     );
   }
@@ -97,9 +106,19 @@ async function ensureCounterInitialized(): Promise<void> {
  * If database is blank, preview will show SOI-1.
  */
 export async function peekNextUniqueId(): Promise<string> {
+  const actualMax = await getActualMaxLeadNumberFromDb();
+  if (actualMax === 0) {
+    await Counter.findByIdAndUpdate(
+      COUNTER_ID,
+      { $set: { seq: 0 } },
+      { upsert: true, new: true }
+    );
+    return "SOI-1";
+  }
+
   await ensureCounterInitialized();
   const counter = await Counter.findById(COUNTER_ID);
-  const currentSeq = counter?.seq ?? 0;
+  const currentSeq = counter?.seq ?? actualMax;
   return `SOI-${currentSeq + 1}`;
 }
 
