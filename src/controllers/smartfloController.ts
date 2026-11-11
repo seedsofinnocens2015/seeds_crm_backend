@@ -580,30 +580,18 @@ export async function handleHangupCall(req: Request, res: Response) {
       callId: effectiveCallId,
     });
 
-    // 5. Lifecycle Synchronization:
-    // If Smartflo indicates the call was already terminated ("Call has already ended"),
-    // reconcile state immediately by emitting outbound:ended.
-    // If Smartflo accepted the hangup request for an in-flight call ("Call hangup request accepted"),
-    // the call is still disconnecting on the carrier switch; do NOT emit outbound:ended here.
-    // The official terminal Smartflo webhook (with hangup cause and billsec) will arrive shortly
-    // and broadcast the confirmed outbound:ended event.
-    if (result.message && result.message.includes("already ended")) {
-      try {
-        broadcastCallEndedEvent(
-          "outbound:ended",
-          {
-            callId: effectiveCallId,
-            refId: effectiveRefId,
-            leadId: lead._id?.toString(),
-            leadUniqueId: lead.uniqueId,
-            status: "ended",
-            timestamp: new Date().toISOString(),
-          },
-          targetUserIdStr
-        );
-      } catch {
-        // non-blocking
-      }
+    // 5. Emit real-time terminal event to clear active call states across CRM agents
+    try {
+      broadcastCallEndedEvent("outbound:ended", {
+        callId: effectiveCallId,
+        refId: effectiveRefId,
+        leadId: lead._id?.toString(),
+        leadUniqueId: lead.uniqueId,
+        status: "ended",
+        timestamp: new Date().toISOString(),
+      }, targetUserIdStr);
+    } catch {
+      // non-blocking
     }
 
     return res.status(200).json({
