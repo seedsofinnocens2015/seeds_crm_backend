@@ -123,20 +123,28 @@ export async function peekNextUniqueId(): Promise<string> {
 }
 
 /**
- * Generates the next sequential unique ID in the format SOI-<number> atomically.
- * MUST ONLY be called when actually creating and persisting a new lead.
- * Guarantees serial progression: SOI-1, SOI-2, SOI-3, etc.
+ * Reserves a contiguous block of N sequential IDs atomically in a single round-trip.
+ * Example: if seq was 0 and count is 1000, updates seq to 1000 and returns 1 (startNum).
+ * Lead IDs will be SOI-1, SOI-2, ..., SOI-1000.
  */
 export async function getNextUniqueId(): Promise<string> {
+  const startNum = await reserveBulkUniqueIds(1);
+  return `SOI-${startNum}`;
+}
+
+export async function reserveBulkUniqueIds(count: number): Promise<number> {
+  if (count <= 0) return 1;
   await ensureCounterInitialized();
 
   const counter = await Counter.findByIdAndUpdate(
     COUNTER_ID,
-    { $inc: { seq: 1 } },
+    { $inc: { seq: count } },
     { new: true, upsert: true }
   );
 
-  return `SOI-${counter?.seq ?? 1}`;
+  const endNum = counter?.seq ?? count;
+  const startNum = endNum - count + 1;
+  return startNum;
 }
 
 /**

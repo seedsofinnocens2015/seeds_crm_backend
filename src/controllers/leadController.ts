@@ -115,7 +115,7 @@ export async function getLeads(req: Request, res: Response) {
             .skip((page - 1) * limit)
             .limit(limit)
             .lean(),
-      Lead.estimatedDocumentCount ? Lead.estimatedDocumentCount() : Lead.countDocuments(query),
+      Lead.countDocuments(query),
       peekNextUniqueId().catch(() => "SOI-1"),
     ]);
 

@@ -9,7 +9,7 @@ import {
   SUB_DISPOSITIONS_MAP,
 } from "../utils/dateUtils.js";
 import { normalizePhoneNumber } from "../utils/phoneUtils.js";
-import { getNextUniqueId } from "../utils/idGenerator.js";
+import { getNextUniqueId, reserveBulkUniqueIds } from "../utils/idGenerator.js";
 import { invalidateDashboardCache } from "../utils/cacheInvalidation.js";
 import { enqueueBulkLeadsForSmartflo } from "../services/smartflo/smartfloSyncService.js";
 
@@ -187,6 +187,18 @@ export async function bulkUploadLeads(req: Request, res: Response) {
     const assignedIdsInBatch = new Set<string>();
     const leadsToInsert = [];
 
+    // Calculate how many new sequential IDs are needed and allocate all at once (1 DB call instead of 1000s)
+    let newIdsNeeded = 0;
+    for (const item of leads) {
+      const mobile = String(item.mobileNumber || item.phoneNumber || "").trim();
+      const normMob = normalizePhoneNumber(mobile) || mobile.replace(/\D/g, "").slice(-10);
+      if (!normMob || !existingMatchesByMobile[normMob]) {
+        newIdsNeeded++;
+      }
+    }
+
+    let nextAvailableSeq = await reserveBulkUniqueIds(newIdsNeeded);
+
     for (const item of leads) {
       const mobile = String(item.mobileNumber || item.phoneNumber || "").trim();
       const normMob = normalizePhoneNumber(mobile) || mobile.replace(/\D/g, "").slice(-10);
@@ -197,8 +209,8 @@ export async function bulkUploadLeads(req: Request, res: Response) {
         assignedId = existingMatchesByMobile[normMob];
         assignedIdsInBatch.add(assignedId);
       } else {
-        // Atomic sequential ID generation
-        assignedId = await getNextUniqueId();
+        // Fast in-memory sequential assignment from pre-reserved block
+        assignedId = `SOI-${nextAvailableSeq++}`;
         assignedIdsInBatch.add(assignedId);
       }
 
@@ -383,7 +395,6 @@ export async function bulkUploadLeads(req: Request, res: Response) {
       success: true,
       count: insertedLeads.length,
       deletedCount,
-      leads: insertedLeads,
       nextUniqueId: nextId,
     });
   } catch (error: any) {
