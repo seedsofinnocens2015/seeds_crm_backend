@@ -14,30 +14,25 @@ async function getActualMaxLeadNumberFromDb(): Promise<number> {
     return 0;
   }
 
-  // Scan leads to find the actual maximum numeric suffix for SOI-<num>
-  const leads = await Lead.find(
+  // Optimize: directly look up the single highest SOI lead using sorting rather than scanning thousands of documents
+  const latestLead = await Lead.findOne(
     { uniqueId: { $regex: /^(?:SOI|SC)-\d+$/i } },
     { uniqueId: 1 }
   )
     .sort({ createdAt: -1 })
-    .limit(2000)
     .lean();
 
-  let maxNum = 0;
-  for (const l of leads) {
-    if (l.uniqueId) {
-      const match = l.uniqueId.match(/^(?:SOI|SC)-(\d+)$/i);
-      if (match) {
-        const num = parseInt(match[1], 10);
-        // Exclude huge arbitrary numbers / timestamps (e.g. > 10,000,000)
-        if (num < 10000000 && num > maxNum) {
-          maxNum = num;
-        }
+  if (latestLead?.uniqueId) {
+    const match = latestLead.uniqueId.match(/^(?:SOI|SC)-(\d+)$/i);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num < 10000000 && !isNaN(num)) {
+        return num;
       }
     }
   }
 
-  return maxNum;
+  return 0;
 }
 
 /**

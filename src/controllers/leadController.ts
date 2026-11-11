@@ -90,7 +90,8 @@ export async function getLeads(req: Request, res: Response) {
       page = 1;
     }
 
-    let limit = 10000;
+    // Default limit 100 leads per page
+    let limit = 100;
     if (limitParam !== undefined && limitParam !== null && limitParam !== "") {
       if (limitParam.toLowerCase() === "all" || limitParam === "0") {
         limit = 0;
@@ -114,8 +115,8 @@ export async function getLeads(req: Request, res: Response) {
             .skip((page - 1) * limit)
             .limit(limit)
             .lean(),
-      Lead.countDocuments(query),
-      peekNextUniqueId(),
+      Lead.estimatedDocumentCount ? Lead.estimatedDocumentCount() : Lead.countDocuments(query),
+      peekNextUniqueId().catch(() => "SOI-1"),
     ]);
 
     // Dynamic real-time calculation of leadAge for each lead
