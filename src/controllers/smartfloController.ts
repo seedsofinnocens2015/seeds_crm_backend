@@ -54,19 +54,33 @@ export function verifySmartfloPullAuth(req: Request): boolean {
  * Receives call event notifications from Smartflo.
  */
 export async function handleSmartfloWebhook(req: Request, res: Response) {
+  const clientIp = req.ip || req.socket.remoteAddress;
+  const rawAuthHeader = req.headers["authorization"] || req.headers["x-webhook-secret"] || req.headers["x-api-key"] || req.headers["secret"];
+  const authHeaderPresent = !!rawAuthHeader;
+
+  // Safe request-entry logging (Never logs sensitive tokens, credentials, or caller numbers)
+  console.info(
+    `[Smartflo Webhook Entry] Received HTTP ${req.method} from IP=${clientIp}, authHeaderPresent=${authHeaderPresent}, contentType=${req.headers["content-type"] || "none"}`
+  );
+
   try {
     const authStatus = verifySmartfloWebhookAuth(req);
     if (authStatus === "unconfigured") {
+      console.error(`[Smartflo Webhook Entry] Failed: SMARTFLO_WEBHOOK_SECRET is unconfigured on server.`);
       return res.status(500).json({
         error: "Server configuration error: Webhook authentication secret is not configured.",
       });
     }
     if (authStatus === "unauthorized") {
+      console.warn(
+        `[Smartflo Webhook Entry] Rejected: 401 Unauthorized from IP=${clientIp}. Header present: ${authHeaderPresent}`
+      );
       return res.status(401).json({ error: "Unauthorized webhook request" });
     }
 
     const payload = req.body;
     if (!payload || typeof payload !== "object") {
+      console.warn(`[Smartflo Webhook Entry] Rejected: 400 Invalid JSON payload from IP=${clientIp}`);
       return res.status(400).json({ error: "Invalid JSON payload" });
     }
 
