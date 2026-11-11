@@ -450,7 +450,7 @@ async function runTests() {
     assert("Direction correctly inferred as 'inbound' from business DID match", savedCallLogDoc.direction === "inbound");
     assert("Status correctly normalized to 'in_progress' for initial in-flight event", savedCallLogDoc.status === "in_progress");
     assert("Customer number extracted from caller_id_number", savedCallLogDoc.customerNumber === "9876543210");
-    assert("Lead correlated via normalized phone", savedCallLogDoc.crmLeadUniqueId === "SOI-1042");
+    assert("Inbound call does NOT attach or auto-link CRM lead while suspended", initialInboundResult.leadMatched === false);
 
     // 5.9 Auto Answer: Immediate Answered Event Updates Existing Session (No Duplicate)
     const autoAnswerPayload: SmartfloWebhookPayload = {
@@ -506,7 +506,8 @@ async function runTests() {
     assert("Unknown destination number does not infer in_progress without DID match", savedCallLogDoc.status === "unknown");
 
     // ==========================================
-    // 5.13 Auto Lead Creation & Deduplication Tests
+    // 5.13 Inbound Telephony Suspension Verification Tests
+    // (Bypasses auto-lead creation, DID routing, and popups)
     // ==========================================
     existingCallLogDoc = null;
     const createdLeads: any[] = [];
@@ -517,52 +518,13 @@ async function runTests() {
     const origLockCreate = LeadCreationLock.create;
     const origLockDeleteOne = LeadCreationLock.deleteOne;
 
-    const activeLocks = new Set<string>();
-    (LeadCreationLock as any).create = async (doc: any) => {
-      if (activeLocks.has(doc.phone)) {
-        const err: any = new Error("E11000 duplicate key error collection");
-        err.code = 11000;
-        throw err;
-      }
-      activeLocks.add(doc.phone);
-      return doc;
-    };
-    (LeadCreationLock as any).deleteOne = async (filter: any) => {
-      activeLocks.delete(filter.phone);
-      return { deletedCount: 1 };
-    };
-
-    (Lead as any).countDocuments = async () => createdLeads.length;
-    let mockSeq = 100;
-    (Counter as any).findById = async () => ({ _id: "lead_unique_id", seq: mockSeq });
-    (Counter as any).findByIdAndUpdate = async (_id: any, update: any) => {
-      if (update?.$inc?.seq) mockSeq += update.$inc.seq;
-      if (update?.$set?.seq !== undefined) mockSeq = update.$set.seq;
-      return { _id: "lead_unique_id", seq: mockSeq };
-    };
-
     (Lead as any).create = async (doc: any) => {
-      const createdDoc = {
-        _id: new mongoose.Types.ObjectId(),
-        uniqueId: doc.uniqueId,
-        wifeName: doc.wifeName,
-        primaryMobileNumber: doc.primaryMobileNumber,
-        normalizedPhone: doc.normalizedPhone,
-        leadOwner: doc.leadOwner,
-        callerName: doc.callerName,
-        createdBy: doc.createdBy,
-        leadSource: doc.leadSource,
-        campaignName: doc.campaignName,
-        sourceName: doc.sourceName,
-        source: doc.source,
-        auditLogs: doc.auditLogs || [],
-      };
-      createdLeads.push(createdDoc);
-      return createdDoc;
+      createdLeads.push(doc);
+      return doc;
     };
 
     try {
-      // Test 1: New customer calls Agent A (Ext 0601001) -> Auto-creates lead assigned to Agent A
+      // Test 1: Inbound customer call never creates lead while inbound suspended
       const newCustomerPayload: SmartfloWebhookPayload = {
         call_id: "CALL_AUTO_CREATE_1",
         caller_id: "9123456789", // New customer
@@ -570,122 +532,35 @@ async function runTests() {
         answered_agent_number: "0601001",
         answered_agent: "Agent Priya",
         start_stamp: "2026-11-10 13:00:00",
+        direction: "inbound",
       };
-
-      // Mock user lookup for agent
-      (User as any).findOne = async () => ({ name: "Agent Priya", smartfloAgentId: "0601001" });
-      // Lead lookup: check createdLeads by normalizedPhone or primaryMobileNumber
-      (Lead as any).findOne = async (q: any) => {
-        if (q?.uniqueId) return null;
-        if (q?.$or) {
-          const phones = q.$or.map((cond: any) => cond.normalizedPhone || cond.primaryMobileNumber || cond.mobileNumber).filter(Boolean);
-          return createdLeads.find(l => phones.includes(l.normalizedPhone) || phones.includes(l.primaryMobileNumber)) || null;
-        }
-        return createdLeads.find(l => l.normalizedPhone === q.normalizedPhone || l.primaryMobileNumber === q.primaryMobileNumber) || null;
-      };
-      const makeQueryChain = (results: any[] = []) => ({
-        sort: () => ({
-          limit: () => ({
-            lean: async () => results,
-          }),
-        }),
-        limit: () => results,
-      });
-
-      Lead.find = ((q: any) => makeQueryChain([])) as any;
 
       const res1 = await processSmartfloWebhook(newCustomerPayload);
-      assert("New number call succeeds", res1.success === true);
-      assert("New lead auto-created in database", createdLeads.length === 1);
-      assert("Auto-created lead assigned to Agent Priya", createdLeads[0].leadOwner === "Agent Priya");
-      assert("Auto-created lead phone matches caller", createdLeads[0].normalizedPhone === "9123456789");
-      assert("Call log links to auto-created lead", savedCallLogDoc.crmLeadUniqueId === createdLeads[0].uniqueId);
+      assert("New number inbound call succeeds", res1.success === true);
+      assert("Inbound call creates ZERO leads while suspended", createdLeads.length === 0);
+      assert("Inbound call reports leadMatched: false", res1.leadMatched === false);
 
-      // Test 2: Same customer calls Agent A again -> Reuses existing lead without duplicate creation
-      Lead.find = ((q: any) => ({
-        limit: () => [createdLeads[0]],
-      })) as any;
+      // Test 2: Repeat inbound call creates no lead
       const res2 = await processSmartfloWebhook({
         call_id: "CALL_AUTO_CREATE_2",
         caller_id: "9123456789",
         called_number: "01140844000",
         answered_agent_number: "0601001",
         answered_agent: "Agent Priya",
+        direction: "inbound",
       });
-      assert("Repeat call from same customer detected", res2.success === true);
-      assert("No second lead created (deduplicated)", createdLeads.length === 1);
-      assert("Associated with existing lead", savedCallLogDoc.crmLeadUniqueId === createdLeads[0].uniqueId);
+      assert("Repeat call from same customer succeeds without lead creation", res2.success === true && createdLeads.length === 0);
 
-      // Test 3: Same customer calls Agent B (Ext 0602002) -> Preserves Agent Priya as original owner!
-      (User as any).findOne = async () => ({ name: "Agent Rahul", smartfloAgentId: "0602002" });
+      // Test 3: Multiple inbound calls create zero leads
       await processSmartfloWebhook({
         call_id: "CALL_AUTO_CREATE_3",
-        caller_id: "9123456789",
-        called_number: "01140844000",
-        answered_agent_number: "0602002",
-        answered_agent: "Agent Rahul",
-      });
-      assert("Call to Agent B does not create another lead", createdLeads.length === 1);
-      assert("Lead owner strictly preserved as Agent Priya", createdLeads[0].leadOwner === "Agent Priya");
-
-      // Test 4: New number with different country code format (+91 99887 76655) -> Correct normalization
-      Lead.find = ((q: any) => makeQueryChain([])) as any;
-      await processSmartfloWebhook({
-        call_id: "CALL_AUTO_CREATE_4",
         caller_id: "+91 99887-76655",
         called_number: "01140844000",
         answered_agent_number: "0602002",
         answered_agent: "Agent Rahul",
+        direction: "inbound",
       });
-      assert("Lead created for second new customer", createdLeads.length === 2);
-      assert("Phone normalized accurately to 10 digits", createdLeads[1].normalizedPhone === "9988776655");
-      assert("Assigned to Agent Rahul", createdLeads[1].leadOwner === "Agent Rahul");
-
-      // Test 5: Auto Dialer call from a new customer
-      await processSmartfloWebhook({
-        call_id: "CALL_AUTO_DIALER_1",
-        caller_id: "9811223344",
-        called_number: "01140844000",
-        direction: "broadcast",
-        answered_agent_number: "0601001",
-        answered_agent: "Agent Priya",
-        broadcast_campaign_details: {
-          broadcast_campaign_name: "IVF_Auto_Dialer_Nov",
-        },
-      });
-      assert("Auto Dialer call created lead", createdLeads.length === 3);
-      assert("Auto Dialer lead source captured", createdLeads[2].leadSource.includes("Auto Dialer"));
-      assert("Auto Dialer campaign name captured", createdLeads[2].campaignName === "IVF_Auto_Dialer_Nov");
-
-      // Test 6: Simultaneous webhook requests for same new number -> Zero duplicate leads created!
-      Lead.find = ((q: any) => makeQueryChain([])) as any;
-      const simPhone = "9900112233";
-      const simPayload1: SmartfloWebhookPayload = {
-        call_id: "CALL_SIM_1",
-        caller_id: simPhone,
-        called_number: "01140844000",
-        answered_agent_number: "0601001",
-        answered_agent: "Agent Priya",
-      };
-      const simPayload2: SmartfloWebhookPayload = {
-        call_id: "CALL_SIM_2",
-        caller_id: simPhone,
-        called_number: "01140844000",
-        answered_agent_number: "0601001",
-        answered_agent: "Agent Priya",
-      };
-
-      const leadsBefore = createdLeads.length;
-      await Promise.all([
-        processSmartfloWebhook(simPayload1),
-        processSmartfloWebhook(simPayload2),
-      ]);
-      const leadsAfter = createdLeads.length;
-      assert("Simultaneous webhook calls create exactly 1 lead (no race condition duplicate)", leadsAfter === leadsBefore + 1);
-
-      // Test 7: Persists actual CRM User ObjectId in createdBy
-      const simLead = createdLeads.find(l => l.normalizedPhone === simPhone);
-      assert("Auto-created lead has valid createdBy user reference", simLead && simLead.createdBy !== undefined);
+      assert("Third inbound call creates zero leads", createdLeads.length === 0);
 
       // ==========================================
       // 5.14 DID-Based Agent-Specific Incoming Call Popup Routing Tests
@@ -736,18 +611,18 @@ async function runTests() {
         select: async () => mockUsers.find(u => u._id.toString() === id.toString()) || null,
       });
 
-      // DID Test 1: Inbound call to Agent 1's DID -> Correlates to Agent 1 and persists agentUserId
+      // DID Test 1: Inbound call while suspended does not perform routing or popup emission
       existingCallLogDoc = null;
       const agent1CallPayload: SmartfloWebhookPayload = {
         call_id: "DID_ROUTING_CALL_1",
         caller_id: "9876543210",
         called_number: "01140844001", // Matches Agent 1 (+911140844001)
         start_stamp: "2026-11-10 14:00:00",
+        direction: "inbound",
       };
       const agent1Result = await processSmartfloWebhook(agent1CallPayload);
-      assert("Inbound call on Agent 1 DID routes to Agent 1", agent1Result.success === true);
-      assert("SmartfloCallLog stores agentUserId for Agent 1", savedCallLogDoc.agentUserId?.toString() === agent1Id.toString());
-      assert("Agent name resolved from User model as Agent Neha", savedCallLogDoc.agentName === "Agent Neha");
+      assert("Inbound call is safely acknowledged", agent1Result.success === true);
+      assert("Inbound call does not trigger popup or lead match", agent1Result.leadMatched === false);
 
       // DID Test 2: Inbound call to Agent 2's DID -> Correlates to Agent 2
       existingCallLogDoc = null;
@@ -847,7 +722,7 @@ async function runTests() {
       });
 
       try {
-        // Test Sync 1: Direct DID-to-agent mapping: Initial "Call received on Server" immediately emits inbound:ringing to target agent!
+        // Test Sync 1: Inbound calling feature suspended: Inbound events do NOT emit inbound:ringing or any popups!
         existingCallLogDoc = null;
         emittedSocketEvents.length = 0;
         const initialServerPayload: SmartfloWebhookPayload = {
@@ -856,60 +731,34 @@ async function runTests() {
           caller_id: "9876543210",
           called_number: "01140844001", // Mapped directly to syncAgentId (Agent Neha)
           start_stamp: "2026-11-10 15:00:00",
+          direction: "inbound",
         };
 
         const serverResult = await processSmartfloWebhook(initialServerPayload);
-        assert("Initial server event processes successfully in background", serverResult.success === true);
-        assert("Initial server event saves call metadata as in_progress", savedCallLogDoc.status === "in_progress");
-        assert("Direct DID match sets agentRung: true on initial server event", savedCallLogDoc.agentRung === true);
-        assert("Direct DID match immediately emits 1 inbound:ringing event", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 1);
-        const initialRinging = emittedSocketEvents.find(e => e.event === "inbound:ringing");
-        assert("Initial ringing emission targets strictly Agent Neha userId", initialRinging?.targetUserId === syncAgentId.toString());
+        assert("Initial server inbound event processes successfully in background", serverResult.success === true);
+        assert("Initial server event saves minimal call metadata as in_progress", savedCallLogDoc.status === "in_progress");
+        assert("Inbound call emits 0 ringing events while suspended", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
+        assert("Inbound call emits zero socket events to any room", emittedSocketEvents.length === 0);
 
-        // Test Sync 1B: Duplicate retry of initial webhook does NOT emit duplicate ringing event
+        // Test Sync 2: Queue flow / "Dialed on Agent" while suspended emits NO popups
         existingCallLogDoc = { ...savedCallLogDoc };
         emittedSocketEvents.length = 0;
-        const retryResult = await processSmartfloWebhook(initialServerPayload);
-        assert("Duplicate webhook retry reports duplicate", retryResult.isDuplicate === true);
-        assert("Duplicate webhook retry does not emit duplicate ringing popup", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
-
-        // Test Sync 1C: Unassigned trunk DID suppresses popup completely
-        existingCallLogDoc = null;
-        emittedSocketEvents.length = 0;
-        const unassignedDidPayload: SmartfloWebhookPayload = {
-          call_id: "UNASSIGNED_CALL_555",
-          event: "Call received on Server",
-          caller_id: "9876543210",
-          called_number: "01140844999", // Trunk DID without assigned agent
-          start_stamp: "2026-11-10 15:00:00",
-        };
-        const unassignedResult = await processSmartfloWebhook(unassignedDidPayload);
-        assert("Unassigned DID call log is saved", unassignedResult.success === true);
-        assert("Unassigned DID call log has agentRung: false", savedCallLogDoc.agentRung === false);
-        assert("Unassigned DID call emits 0 ringing popups", emittedSocketEvents.length === 0);
-
-        // Test Sync 2: Queue flow / "Dialed on Agent" when arriving for unannounced call emits inbound:ringing
-        existingCallLogDoc = { ...savedCallLogDoc, agentRung: false };
-        emittedSocketEvents.length = 0;
         const dialedOnAgentPayload: SmartfloWebhookPayload = {
-          call_id: "UNASSIGNED_CALL_555",
+          call_id: "SYNC_CALL_100",
           event: "Dialed on Agent",
           caller_id: "9876543210",
-          called_number: "01140844999",
+          called_number: "01140844001",
           agent_extension: "0608001",
           agent_name: "Agent Neha",
           call_status: "ringing",
+          direction: "inbound",
         };
 
         const dialedResult = await processSmartfloWebhook(dialedOnAgentPayload);
-        assert("Dialed on Agent processes successfully", dialedResult.success === true);
-        assert("Dialed on Agent marks agentRung: true in call log", savedCallLogDoc.agentRung === true);
-        assert("Dialed on Agent emits exactly 1 inbound:ringing event", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 1);
-        const ringingEmission = emittedSocketEvents.find(e => e.event === "inbound:ringing");
-        assert("Ringing emission targets strictly Agent Neha userId", ringingEmission?.targetUserId === syncAgentId.toString());
-        assert("Ringing emission never targets other agent or global room", ringingEmission?.targetUserId !== syncAgentOtherId.toString());
+        assert("Dialed on Agent inbound processes successfully", dialedResult.success === true);
+        assert("Dialed on Agent emits zero popups while inbound suspended", emittedSocketEvents.length === 0);
 
-        // Test Sync 3: Auto Answer connects -> Emits inbound:answered to update existing popup
+        // Test Sync 3: Inbound Auto Answer connects -> Logs without popup while suspended
         existingCallLogDoc = { ...savedCallLogDoc };
         emittedSocketEvents.length = 0;
         const autoAnswerPayload: SmartfloWebhookPayload = {
@@ -917,40 +766,19 @@ async function runTests() {
           event: "Call Answered by Agent",
           call_status: "answered",
           answer_stamp: "2026-11-10 15:00:03",
+          direction: "inbound",
           agents_answered_details: [
             { id: "0501", name: "Agent Neha", extension: "0608001" },
           ],
         };
 
         const autoAnswerResult = await processSmartfloWebhook(autoAnswerPayload);
-        assert("Auto Answer processes successfully as update", autoAnswerResult.isDuplicate === true);
-        assert("Auto Answer status updated to answered", savedCallLogDoc.status === "answered");
-        assert("Auto Answer emits inbound:answered event", emittedSocketEvents.filter(e => e.event === "inbound:answered").length === 1);
-        const answeredEmission = emittedSocketEvents.find(e => e.event === "inbound:answered");
-        assert("Answered emission routes to same target agent", answeredEmission?.targetUserId === syncAgentId.toString());
+        assert("Inbound answer processes successfully as update", autoAnswerResult.isDuplicate === true);
+        assert("Inbound answer status updated to answered in call log", savedCallLogDoc.status === "answered");
+        assert("Inbound answer emits zero socket events while suspended", emittedSocketEvents.length === 0);
 
-        // Test Sync 4: Answered arriving BEFORE Dialed on Agent (Fast Auto Answer)
-        existingCallLogDoc = null;
-        emittedSocketEvents.length = 0;
-        const directAnswerPayload: SmartfloWebhookPayload = {
-          call_id: "FAST_ANSWER_CALL_200",
-          event: "Call Answered by Agent",
-          caller_id: "9876543210",
-          called_number: "01140844001",
-          call_status: "answered",
-          agents_answered_details: [
-            { id: "0501", name: "Agent Neha", extension: "0608001" },
-          ],
-        };
-
-        const directAnswerResult = await processSmartfloWebhook(directAnswerPayload);
-        assert("Direct Answer without prior Dialed on Agent succeeds", directAnswerResult.success === true);
-        assert("Direct Answer emits inbound:answered directly", emittedSocketEvents.some(e => e.event === "inbound:answered" && e.targetUserId === syncAgentId.toString()));
-        assert("Direct Answer does not emit ringing popup", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
-
-        // Test Sync 5: Terminal Hangup payload containing call_status: "answered", duration: 45, billsec: 40, hangup_cause_description
-        // A) When popup was open (hadPriorAgentRung), emits inbound:ended to close popup; NEVER inbound:answered or inbound:ringing!
-        existingCallLogDoc = { ...savedCallLogDoc, agentRung: true, agentUserId: syncAgentId, direction: "inbound" };
+        // Test Sync 4: Inbound Terminal Hangup payload -> Updates database log ONLY and emits zero popups!
+        existingCallLogDoc = { ...savedCallLogDoc, direction: "inbound" };
         emittedSocketEvents.length = 0;
         const actualTerminalHangupPayload: SmartfloWebhookPayload = {
           event: "call_hangup",
@@ -964,44 +792,30 @@ async function runTests() {
           hangup_cause_description: "NORMAL_CLEARING",
         };
         const terminalHangupResult = await processSmartfloWebhook(actualTerminalHangupPayload);
-        assert("Terminal Hangup with call_status 'answered' processes successfully", terminalHangupResult.success === true);
-        assert("Terminal Hangup preserves historical status 'answered' in DB", savedCallLogDoc.status === "answered");
-        assert("Terminal Hangup records duration (45s)", savedCallLogDoc.durationSeconds === 45);
-        assert("Terminal Hangup records answered duration (40s)", savedCallLogDoc.answeredDurationSeconds === 40);
-        assert("Terminal Hangup NEVER emits inbound:answered", emittedSocketEvents.filter(e => e.event === "inbound:answered").length === 0);
-        assert("Terminal Hangup NEVER emits inbound:ringing", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
-        assert("Terminal Hangup for active popup emits inbound:ended to target agent", emittedSocketEvents.some(e => e.event === "inbound:ended" && e.targetUserId === syncAgentId.toString()));
+        assert("Inbound terminal hangup updates database log", terminalHangupResult.success === true);
+        assert("Inbound terminal hangup records duration (45s)", savedCallLogDoc.durationSeconds === 45);
+        assert("Inbound terminal hangup records answered duration (40s)", savedCallLogDoc.answeredDurationSeconds === 40);
+        assert("Inbound terminal hangup NEVER emits inbound:answered", emittedSocketEvents.filter(e => e.event === "inbound:answered").length === 0);
+        assert("Inbound terminal hangup NEVER emits inbound:ringing", emittedSocketEvents.filter(e => e.event === "inbound:ringing").length === 0);
+        assert("Inbound terminal hangup emits zero events while suspended", emittedSocketEvents.length === 0);
 
-        // B) When popup was never opened (agentRung is false), performs database log update ONLY and emits zero popups!
+        // Test Sync 5: Outbound terminal call session -> Emits outbound:ended and call:ended as expected!
         existingCallLogDoc = null;
         emittedSocketEvents.length = 0;
-        const unannouncedHangupPayload: SmartfloWebhookPayload = {
-          event: "call_hangup",
-          call_id: "UNANNOUNCED_CALL_999",
-          call_status: "answered",
-          direction: "inbound",
-          caller_id_number: "9876543210",
-          called_number: "01140844001",
-          duration: 25,
-          billsec: 20,
-          hangup_cause_description: "NORMAL_CLEARING",
+        const outboundTerminalPayload: SmartfloWebhookPayload = {
+          call_id: "OUTBOUND_TEST_CALL_777",
+          direction: "outbound",
+          Status: "Answered",
+          DestinationNumber: "9876543210",
+          duration: 60,
+          billsec: 55,
+          ref_id: "REF_OUTBOUND_777",
+          custom_identifier: { lead_unique_id: "SOI-1042" },
         };
-        const unannouncedResult = await processSmartfloWebhook(unannouncedHangupPayload);
-        assert("Unannounced terminal hangup updates database log", unannouncedResult.success === true);
-        assert("Unannounced terminal hangup emits ZERO popups to agents", emittedSocketEvents.length === 0);
-
-        // Test Sync 6: Missed call BEFORE agent routing -> Zero agent ringing popups
-        existingCallLogDoc = null;
-        emittedSocketEvents.length = 0;
-        const missedBeforeAgentPayload: SmartfloWebhookPayload = {
-          call_id: "ABANDONED_CALL_300",
-          event: "Call Hangup",
-          Status: "Missed",
-          caller_id: "9911223344",
-          called_number: "01140844999", // Unassigned trunk number
-        };
-        await processSmartfloWebhook(missedBeforeAgentPayload);
-        assert("Missed call before agent routing does not fire popup to any agent", emittedSocketEvents.length === 0);
+        const outboundTerminalResult = await processSmartfloWebhook(outboundTerminalPayload);
+        assert("Outbound terminal webhook succeeds", outboundTerminalResult.success === true);
+        assert("Outbound terminal webhook emits outbound:ended", emittedSocketEvents.some(e => e.event === "outbound:ended"));
+        assert("Outbound terminal webhook emits call:ended", emittedSocketEvents.some(e => e.event === "call:ended"));
       } finally {
         _setSocketTestInterceptor(null);
       }

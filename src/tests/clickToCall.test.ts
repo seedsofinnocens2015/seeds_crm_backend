@@ -647,18 +647,17 @@ async function runClickToCallTests() {
         assert("Payload with call_type 'outbound' normalizes direction to 'outbound'", savedCallData?.direction === "outbound");
         assert("Agent name 'Amit Kumar' extracted cleanly", savedCallData?.agentName === "Amit Kumar");
 
-        // Case B: Smartflo sends raw agent as object or stringified object
+        // Case B: Inbound suspension verification: inbound call logs as direction: inbound, never attaches to lead, never creates audit
         await processSmartfloWebhook({
-          call_id: "CALL_AGENT_OBJ_TEST",
+          call_id: "INBOUND_SUSPENDED_TEST",
           direction: "inbound",
           SourceNumber: "9876543210",
-          agent_name: "[object Object]",
-          answer_agent_name: "Amit Kumar",
+          agent_name: "Amit Kumar",
           CallDuration: 20,
-          custom_identifier: { lead_unique_id: "SOI-999" },
         });
 
-        assert("Fallback to answer_agent_name when agent_name is [object Object]", savedCallData?.agentName === "Amit Kumar");
+        assert("Inbound call is recognized as direction 'inbound'", savedCallData?.direction === "inbound");
+        assert("Inbound call duration is recorded", savedCallData?.durationSeconds === 20);
 
         // Case C: Click-to-call payload with outbound_type: "click_to_call"
         await processSmartfloWebhook({
@@ -673,34 +672,34 @@ async function runClickToCallTests() {
         assert("Payload with outbound_type 'click_to_call' normalizes direction to 'outbound'", savedCallData?.direction === "outbound");
         assert("Agent object extracted to string name 'Amit Kumar'", savedCallData?.agentName === "Amit Kumar");
 
-        // Case D: Inbound Ringing (Call Received On Server)
+        // Case D: Outbound Ringing (Call Initiated / Progress)
         await processSmartfloWebhook({
-          call_id: "INBOUND_RING_101",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          call_id: "OUTBOUND_RING_101",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "in_progress",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
 
-        assert("Inbound ringing event sets direction to 'inbound'", savedCallData?.direction === "inbound");
-        assert("Inbound ringing event normalizes customer number", savedCallData?.customerNumber === "919876543210");
-        assert("Inbound ringing status normalized to 'in_progress'", savedCallData?.status === "in_progress");
-        assert("Inbound call associates matched lead", savedCallData?.crmLeadUniqueId === "SOI-999");
+        assert("Outbound ringing event sets direction to 'outbound'", savedCallData?.direction === "outbound");
+        assert("Outbound ringing event normalizes customer number", savedCallData?.customerNumber === "919876543210");
+        assert("Outbound ringing status normalized to 'in_progress'", savedCallData?.status === "in_progress");
+        assert("Outbound call associates matched lead", savedCallData?.crmLeadUniqueId === "SOI-999");
 
-        // Case E: Inbound Answered by Agent
+        // Case E: Outbound Answered by Customer
         await processSmartfloWebhook({
-          call_id: "INBOUND_RING_101",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          call_id: "OUTBOUND_RING_101",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "answered",
           answered_agent: "0608426290047",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
 
-        assert("Inbound answered event upgrades status to 'answered'", savedCallData?.status === "answered");
-        assert("Inbound answered agent captured correctly", savedCallData?.agentName === "0608426290047");
+        assert("Outbound answered event upgrades status to 'answered'", savedCallData?.status === "answered");
+        assert("Outbound answered agent captured correctly", savedCallData?.agentName === "0608426290047");
 
-        // Case F: Inbound Hangup with duration and recording
+        // Case F: Outbound Hangup with duration and recording
         let leadAuditPushed = 0;
         let leadAuditUpdated = 0;
         let updatedAuditValue = "";
@@ -726,42 +725,42 @@ async function runClickToCallTests() {
           return null;
         };
 
-        // First event: ringing pushes initial activity
+        // First event: ringing pushes initial activity for outbound call
         (SmartfloCallLog as any).findOne = async () => null;
         await processSmartfloWebhook({
           call_id: "LIFECYCLE_CALL_1",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "in_progress",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
-        assert("Initial ringing event pushes 1 auditLog entry", leadAuditPushed === 1);
+        assert("Initial outbound ringing event pushes 1 auditLog entry", leadAuditPushed === 1);
 
         // Second event: answered updates existing activity in-place
         (SmartfloCallLog as any).findOne = async () => savedCallData;
         await processSmartfloWebhook({
           call_id: "LIFECYCLE_CALL_1",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "answered",
           answered_agent: "0608426290047",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
-        assert("Answered event does NOT push second auditLog", leadAuditPushed === 1);
-        assert("Answered event updates auditLog in-place", leadAuditUpdated >= 1);
+        assert("Outbound answered event does NOT push second auditLog", leadAuditPushed === 1);
+        assert("Outbound answered event updates auditLog in-place", leadAuditUpdated >= 1);
         assert("Updated audit text contains ANSWERED", updatedAuditValue.includes("ANSWERED"));
 
         // Third event: hangup updates final duration and recording
         await processSmartfloWebhook({
           call_id: "LIFECYCLE_CALL_1",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "answered",
           answered_agent: "0608426290047",
           duration: 90,
           answered_duration: 85,
           recording_url: "https://smartflo.tatateleservices.com/rec/123.wav",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
         assert("Hangup event preserves exactly 1 auditLog on the lead", leadAuditPushed === 1);
         assert("Hangup event captures duration (1m 25s)", updatedAuditValue.includes("1m 25s"));
@@ -770,10 +769,10 @@ async function runClickToCallTests() {
         // Out-of-order event: Late 'in_progress' does not regress answered terminal status
         await processSmartfloWebhook({
           call_id: "LIFECYCLE_CALL_1",
-          direction: "inbound",
-          SourceNumber: "919876543210",
-          call_to_number: "919228173971",
+          direction: "outbound",
+          DestinationNumber: "919876543210",
           status: "in_progress",
+          custom_identifier: { lead_unique_id: "SOI-999" },
         });
         assert("Out-of-order 'in_progress' does not regress answered status", savedCallData?.status === "answered");
         assert("Out-of-order event preserves recording URL", savedCallData?.recordingUrl === "https://smartflo.tatateleservices.com/rec/123.wav");

@@ -479,6 +479,82 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       }
     }
   }
+
+  // CONTROLLED INBOUND TELEPHONY SUSPENSION:
+  // Inbound calling feature is temporarily suspended.
+  // When an event is identified as inbound:
+  // 1. Completely bypass auto lead creation (Lead.create).
+  // 2. Completely bypass DID-to-agent matching and user assignment.
+  // 3. Completely suppress all inbound Socket.IO events (inbound:ringing, inbound:answered, inbound:missed, inbound:ended).
+  // 4. Do not touch or modify any outbound sessions.
+  // 5. Optionally record minimal log entry for telecom auditing without modifying CRM leads.
+  if (direction === "inbound") {
+    console.info(
+      `[Smartflo Webhook] Inbound telephony temporarily suspended. Skipped auto lead creation, DID matching, and popup events for callId=${callId}.`
+    );
+
+    // Save or update minimal call log for telecom audit tracking (without attaching to any CRM lead or emitting events)
+    try {
+      const statusWeight: Record<string, number> = {
+        unknown: 0,
+        in_progress: 10,
+        ringing: 10,
+        answered: 20,
+        connected: 20,
+        no_answer: 30,
+        missed: 30,
+        busy: 30,
+        failed: 30,
+      };
+      const currentWeight = statusWeight[existingRecord?.status || "unknown"] || 0;
+      const incomingWeight = statusWeight[status] || 0;
+      const finalStatus = existingRecord && currentWeight >= 20 && incomingWeight < currentWeight
+        ? existingRecord.status
+        : status;
+
+      const basicCallLog = await SmartfloCallLog.findOneAndUpdate(
+        { callId },
+        {
+          $set: {
+            callId,
+            uuid: String(payload.uuid || existingRecord?.uuid || ""),
+            refId: String(payload.ref_id || payload.refId || existingRecord?.refId || ""),
+            customerNumber,
+            normalizedCustomerPhone: normalizedPhone,
+            direction: "inbound",
+            status: finalStatus,
+            durationSeconds: totalDuration > 0 ? totalDuration : (existingRecord?.durationSeconds || 0),
+            answeredDurationSeconds: answeredDuration > 0 ? answeredDuration : (existingRecord?.answeredDurationSeconds || 0),
+            startTime: startTime ?? existingRecord?.startTime ?? undefined,
+            endTime: endTime ?? existingRecord?.endTime ?? undefined,
+            recordingUrl: recordingUrl || existingRecord?.recordingUrl || "",
+            recordingAvailable: hasRecording || !!existingRecord?.recordingAvailable,
+            agentName: agentName || existingRecord?.agentName || "",
+            agentNumber: agentNumber || existingRecord?.agentNumber || "",
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+
+      return {
+        success: true,
+        isDuplicate,
+        callLogId: basicCallLog?._id?.toString(),
+        callId,
+        leadMatched: false,
+        message: `Inbound event ${callId} logged (inbound telephony suspended; no lead created or popup emitted).`,
+      };
+    } catch (logErr: any) {
+      console.warn(`[Smartflo Webhook] Inbound call log recording notice for callId=${callId}: ${logErr.message}`);
+      return {
+        success: true,
+        isDuplicate,
+        callId,
+        leadMatched: false,
+        message: `Inbound telephony suspended.`,
+      };
+    }
+  }
   let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
   const callerDid = String(
     payload.call_to_number ??
@@ -837,7 +913,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   // In direct DID-to-agent architectures, Smartflo does not dispatch an intermediate "Dialed on Agent" webhook.
   // When an inbound call arrives on a business DID that uniquely maps to an active CRM agent (matchedAgentUserId),
   // that initial in-progress server event confirms immediate agent delivery/ringing.
-  const isDirectDidMatch = (status === "in_progress" && !!finalAgentUserId && direction === "inbound");
+  const isDirectDidMatch = (status === "in_progress" && !!finalAgentUserId && (direction as string) === "inbound");
 
   // An agent is confirmed rung/offered if:
   // 1. Direct DID-to-agent mapping resolved a unique active CRM agent on the incoming call, OR
@@ -955,7 +1031,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   }
 
   // Step 4: Real-Time Call Popups and Lifecycle Synchronization for CRM
-  if (direction === "inbound") {
+  if ((direction as string) === "inbound") {
     const calledDid = String(payload.call_to_number ?? payload.did ?? payload.DestinationNumber ?? payload.DisplayNumber ?? "");
     const leadDisplayName = matchedLead
       ? (matchedLead.wifeName || matchedLead.husbandName || matchedLead.patientName || "Valued Lead")

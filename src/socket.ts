@@ -169,6 +169,10 @@ export function broadcastCallEndedEvent(
   data: CallEndedNotification,
   targetUserId?: string
 ) {
+  if (testEventInterceptor) {
+    testEventInterceptor(event, data, targetUserId);
+  }
+
   if (!ioInstance) return;
 
   // Always emit to general telephony room
