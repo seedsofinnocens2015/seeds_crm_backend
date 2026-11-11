@@ -4,14 +4,7 @@ import { User } from "../../models/User.js";
 import { SmartfloCallLog, ISmartfloCallLog } from "../../models/SmartfloCallLog.js";
 import { LeadCreationLock } from "../../models/LeadCreationLock.js";
 import { normalizePhoneNumber } from "../../utils/phoneUtils.js";
-import {
-  broadcastInboundCallEvent,
-  broadcastCallEndedEvent,
-  broadcastOutboundCallEvent,
-  InboundCallNotification,
-  CallEndedNotification,
-  OutboundCallNotification,
-} from "../../socket.js";
+import { broadcastInboundCallEvent, broadcastCallEndedEvent, InboundCallNotification, CallEndedNotification } from "../../socket.js";
 import { config } from "../../config/env.js";
 import { SOURCE_NAME_TO_INFO, getFormattedTimestamp, getTodayDDMMMYY, getCurrentMonthMMMYY } from "../../utils/dateUtils.js";
 import { getNextUniqueId } from "../../utils/idGenerator.js";
@@ -381,54 +374,15 @@ function parseSafeDate(raw: any): Date | undefined {
  * Idempotent, deduplicated, matches lead safely by external ID or normalized phone.
  */
 export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): Promise<WebhookProcessingResult> {
-  // 1. Call ID validation and verified alias resolution
-  // Smartflo provides call identifier through verified aliases:
-  // - call_id / CallSessionId / callId / callID
-  // - session_id / call_session_id / SessionId
-  // - uuid (Stable provider UUID when call_id template variable is unresolved or omitted)
-  const candidateId =
-    payload.call_id ??
-    payload.CallSessionId ??
-    payload.callId ??
-    payload.callID ??
-    payload.session_id ??
-    payload.call_session_id ??
-    payload.SessionId;
-
-  // Check if candidateId is a resolved string or number (not an un-interpolated template literal like "$call_id" or "")
-  const isResolvedIdentifier = (val: any): boolean => {
-    if (val === undefined || val === null) return false;
-    const str = String(val).trim();
-    if (!str || str.startsWith("$") || str.toLowerCase() === "undefined" || str.toLowerCase() === "null") {
-      return false;
-    }
-    return true;
-  };
-
-  let resolvedCallId = "";
-  if (isResolvedIdentifier(candidateId)) {
-    resolvedCallId = String(candidateId).trim();
-  } else if (isResolvedIdentifier(payload.uuid)) {
-    // Fallback to verified stable provider UUID if template variable $call_id was not populated by Smartflo
-    resolvedCallId = String(payload.uuid).trim();
+  // 1. Call ID validation
+  const rawCallId = payload.CallSessionId ?? payload.call_id ?? payload.callId;
+  if (rawCallId === undefined || rawCallId === null || String(rawCallId).trim() === "") {
+    throw new Error("Missing mandatory 'call_id' in webhook payload.");
   }
-
-  if (!resolvedCallId) {
-    const availableKeys = Object.keys(payload).filter((k) => isResolvedIdentifier(payload[k]));
-    throw new Error(
-      `Missing mandatory 'call_id' in webhook payload. Available keys with values: [${availableKeys.join(", ")}]`
-    );
-  }
-  const callId = resolvedCallId;
+  const callId = String(rawCallId).trim();
 
   // Check existing SmartfloCallLog for this callId first to retain direction, agentUserId & correlation
-  // Also check by uuid or refId if previously linked
-  const existingRecord = await SmartfloCallLog.findOne({
-    $or: [
-      { callId },
-      ...(payload.uuid && isResolvedIdentifier(payload.uuid) ? [{ uuid: String(payload.uuid).trim() }] : []),
-    ],
-  });
+  const existingRecord = await SmartfloCallLog.findOne({ callId });
   const isDuplicate = !!existingRecord;
 
   // 2. Direction normalization (inherit from existingRecord if payload lacks explicit direction)
@@ -440,48 +394,36 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   // - Inbound: SourceNumber is the calling customer; DestinationNumber is company DID.
   // - Outbound: DestinationNumber is the called customer; SourceNumber is agent/company DID.
   // - Unknown: Safely inspect customer_number first, then SourceNumber / DestinationNumber.
-  const cleanPhoneCandidate = (candidate: any): string => {
-    if (candidate === undefined || candidate === null) return "";
-    const str = String(candidate).trim();
-    if (!str || str.startsWith("$") || str.toLowerCase() === "undefined" || str.toLowerCase() === "null") {
-      return "";
-    }
-    return str;
-  };
-
   let rawCustomerPhone = "";
   if (direction === "inbound") {
-    rawCustomerPhone =
-      cleanPhoneCandidate(payload.caller_id_number) ||
-      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
-      cleanPhoneCandidate(payload["customer_no_with_prefix "]) ||
-      cleanPhoneCandidate(payload.customer_number_with_prefix) ||
-      cleanPhoneCandidate(payload.customer_number) ||
-      cleanPhoneCandidate(payload.caller_id) ||
-      cleanPhoneCandidate(payload.SourceNumber) ||
-      "";
+    rawCustomerPhone = String(
+      payload.caller_id_number ??
+      payload.caller_id ??
+      payload.SourceNumber ??
+      payload.customer_number ??
+      ""
+    );
   } else if (direction === "outbound") {
-    rawCustomerPhone =
-      cleanPhoneCandidate(payload.DestinationNumber) ||
-      cleanPhoneCandidate(payload.customer_number) ||
-      cleanPhoneCandidate(payload.call_to_number) ||
-      cleanPhoneCandidate(payload.called_number) ||
-      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
-      cleanPhoneCandidate(payload.SourceNumber) ||
-      "";
+    rawCustomerPhone = String(
+      payload.DestinationNumber ??
+      payload.customer_number ??
+      payload.call_to_number ??
+      payload.called_number ??
+      payload.SourceNumber ??
+      ""
+    );
   } else {
     // Missing or unknown direction: safely prioritize explicit customer_number, then SourceNumber, then DestinationNumber
-    rawCustomerPhone =
-      cleanPhoneCandidate(payload.customer_number) ||
-      cleanPhoneCandidate(payload.customer_no_with_prefix) ||
-      cleanPhoneCandidate(payload["customer_no_with_prefix "]) ||
-      cleanPhoneCandidate(payload.caller_id_number) ||
-      cleanPhoneCandidate(payload.caller_id) ||
-      cleanPhoneCandidate(payload.SourceNumber) ||
-      cleanPhoneCandidate(payload.DestinationNumber) ||
-      cleanPhoneCandidate(payload.call_to_number) ||
-      cleanPhoneCandidate(payload.called_number) ||
-      "";
+    rawCustomerPhone = String(
+      payload.customer_number ??
+      payload.caller_id_number ??
+      payload.caller_id ??
+      payload.SourceNumber ??
+      payload.DestinationNumber ??
+      payload.call_to_number ??
+      payload.called_number ??
+      ""
+    );
   }
 
   const customerNumber = rawCustomerPhone.trim();
@@ -537,23 +479,8 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       }
     }
   }
-
-  // Also check call_flow array for Agent node if agentNumber or agentName is still missing
-  if ((!agentNumber || !agentName) && Array.isArray(payload.call_flow)) {
-    for (const step of payload.call_flow) {
-      if (step && typeof step === "object" && (step.type === "Agent" || step.type === "agent")) {
-        if (!agentNumber && (step.num || step.extension || step.number || step.id)) {
-          agentNumber = String(step.num || step.extension || step.number || step.id).trim();
-        }
-        if (!agentName && (step.name || step.agent_name)) {
-          agentName = String(step.name || step.agent_name).trim();
-        }
-        if (agentNumber && agentName) break;
-      }
-    }
-  }
   let matchedAgentUserId: mongoose.Types.ObjectId | null = existingRecord?.agentUserId || null;
-  const rawCallerDid = String(
+  const callerDid = String(
     payload.call_to_number ??
     payload.called_number ??
     payload.did ??
@@ -561,7 +488,6 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     payload.DisplayNumber ??
     ""
   ).trim();
-  const callerDid = rawCallerDid.startsWith("$") ? "" : rawCallerDid;
 
   // Multi-Agent Correlation by DID (smartfloCallerId) and Agent Extension:
   // Correlate against User database to resolve actual User ObjectId and official name.
@@ -612,22 +538,14 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
         }
       }
 
-      // 2. If agent extension/number is present in payload or call_flow, verify or correlate directly by extension
-      const cleanAgentNumber = agentNumber.replace(/^Extension-/i, "").trim();
-      const extCandidates: string[] = [];
-      if (agentNumber) extCandidates.push(agentNumber);
-      if (cleanAgentNumber && cleanAgentNumber !== agentNumber) extCandidates.push(cleanAgentNumber);
-
-      if (extCandidates.length > 0) {
-        const extConditions: any[] = [];
-        for (const ext of extCandidates) {
-          extConditions.push({ smartfloAgentId: ext });
-          extConditions.push({ smartfloAgentNumber: ext });
-          extConditions.push({ smartfloCallerId: ext });
-        }
-
+      // 2. If agent extension/number is present in payload, verify or correlate directly by extension
+      if (agentNumber) {
         const matchedByExt = await User.find({
-          $or: extConditions,
+          $or: [
+            { smartfloAgentId: agentNumber },
+            { smartfloAgentNumber: agentNumber },
+            { smartfloCallerId: agentNumber },
+          ],
           status: "active",
         }).select("_id name role smartfloAgentId smartfloAgentNumber smartfloCallerId");
 
@@ -722,8 +640,18 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   if (!matchedLead && matchingMethod !== "ambiguous" && normalizedPhone && normalizedPhone.length >= 10) {
     let acquiredLock = false;
     try {
-      // 1. Double check if lead was created just before lock attempt
-      let existingCheck = await Lead.findOne({
+      // 1. Acquire distributed DB-level lock for this phone number
+      try {
+        await LeadCreationLock.create({ phone: normalizedPhone });
+        acquiredLock = true;
+      } catch (lockErr: any) {
+        // Lock already held by a simultaneous request. Wait slightly for the competitor to finish.
+        console.warn(`[Smartflo Webhook] Simultaneous lead creation in-flight for phone ${normalizedPhone}. Awaiting creation.`);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+
+      // 2. Check if lead now exists
+      const existingCheck = await Lead.findOne({
         $or: [
           { normalizedPhone: normalizedPhone },
           { primaryMobileNumber: normalizedPhone },
@@ -734,129 +662,79 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       if (existingCheck) {
         matchedLead = existingCheck;
         matchingMethod = "phone_primary";
-      } else {
-        // Attempt to acquire distributed DB-level lock for this phone number
-        try {
-          await LeadCreationLock.create({ phone: normalizedPhone });
-          acquiredLock = true;
-        } catch (lockErr: any) {
-          // Lock already held by a simultaneous request. Wait slightly for the competitor to finish.
-          console.warn(
-            `[Smartflo Webhook] Lock conflict for phone ${normalizedPhone.slice(-4).padStart(normalizedPhone.length, "*")} (callId: ${callId}). Waiting for competing worker.`
-          );
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
+      } else if (acquiredLock) {
+        const assignedOwnerName = agentName || "Smartflo Dialer";
+        const autoUniqueId = await getNextUniqueId();
+        const todayDate = getTodayDDMMMYY();
+        const currentMonth = getCurrentMonthMMMYY();
+        const currentTimestamp = getFormattedTimestamp(new Date());
 
-        // Re-check after waiting or acquiring lock
-        existingCheck = await Lead.findOne({
-          $or: [
-            { normalizedPhone: normalizedPhone },
-            { primaryMobileNumber: normalizedPhone },
-            { mobileNumber: normalizedPhone },
+        // Derive campaign/source from DID if available
+        const didClean = callerDid.replace(/\D/g, "");
+        const didTen = didClean.slice(-10);
+        const didInfo = SOURCE_NAME_TO_INFO[didTen] || SOURCE_NAME_TO_INFO[didClean] || null;
+
+        const callSource = direction === "broadcast" || payload.broadcast_campaign_details
+          ? "Smartflo Auto Dialer"
+          : "Inbound Call";
+
+        const newLeadDoc = await Lead.create({
+          uniqueId: autoUniqueId,
+          firstActivityDate: currentTimestamp,
+          primaryMobileNumber: customerNumber,
+          normalizedPhone: normalizedPhone,
+          wifeName: "Inbound Caller",
+          husbandName: "",
+          husbandAge: "28",
+          wifeAge: "26",
+          preMedicalConditions: "No",
+          marriedSince: "1",
+          tryingToConceiveYears: "1",
+          leadSource: didInfo?.source || callSource,
+          campaignName: didInfo?.campaignName || (payload.broadcast_campaign_details?.broadcast_campaign_name || "Smartflo Inbound"),
+          sourceName: callerDid || "Smartflo Pilot DID",
+          source: didInfo?.source || "Telephony",
+          subStatus: "Fresh Lead",
+          leadStage: "Fresh Lead",
+          leadValidStatus: "Valid",
+          centreLocation: "Noida Sector 62",
+          centreAddress: "Seeds IVF Centre",
+          leadOwner: assignedOwnerName,
+          callerName: assignedOwnerName,
+          createdBy: matchedAgentUserId,
+          notes: `Auto-created via ${callSource} received on DID ${callerDid || "Pilot"} assigned to extension ${agentNumber || "unassigned"}.`,
+          date: todayDate,
+          dateOfLead: todayDate,
+          month: currentMonth,
+          leadTimestamp: currentTimestamp,
+          assignedDate: todayDate,
+          assignedAt: new Date().toISOString(),
+          auditLogs: [
+            {
+              performedBy: assignedOwnerName,
+              performedByRole: "agent",
+              performedByEmail: "dialer@smartflo.crm",
+              timestamp: new Date().toISOString(),
+              changes: [
+                {
+                  field: "created",
+                  fieldLabel: "Auto Lead Creation",
+                  oldValue: "",
+                  newValue: `Lead auto-created from ${callSource} (${customerNumber}) assigned to ${assignedOwnerName}`,
+                },
+              ],
+            },
           ],
         });
 
-        if (existingCheck) {
-          matchedLead = existingCheck;
-          matchingMethod = "phone_primary";
-        } else if (acquiredLock) {
-          // Double check once more that competitor didn't write
-          const assignedOwnerName = agentName || "Smartflo Dialer";
-          const autoUniqueId = await getNextUniqueId();
-          const todayDate = getTodayDDMMMYY();
-          const currentMonth = getCurrentMonthMMMYY();
-          const currentTimestamp = getFormattedTimestamp(new Date());
-
-          // Derive campaign/source from DID if available
-          const didClean = callerDid.replace(/\D/g, "");
-          const didTen = didClean.slice(-10);
-          const didInfo = SOURCE_NAME_TO_INFO[didTen] || SOURCE_NAME_TO_INFO[didClean] || null;
-
-          const callSource = direction === "broadcast" || payload.broadcast_campaign_details
-            ? "Smartflo Auto Dialer"
-            : "Inbound Call";
-
-          try {
-            const newLeadDoc = await Lead.create({
-              uniqueId: autoUniqueId,
-              firstActivityDate: currentTimestamp,
-              primaryMobileNumber: customerNumber,
-              normalizedPhone: normalizedPhone,
-              wifeName: "Inbound Caller",
-              husbandName: "",
-              husbandAge: "28",
-              wifeAge: "26",
-              preMedicalConditions: "No",
-              marriedSince: "1",
-              tryingToConceiveYears: "1",
-              callingConsent: "No",
-              whatsappConsent: "No",
-              leadSource: didInfo?.source || callSource,
-              campaignName: didInfo?.campaignName || (payload.broadcast_campaign_details?.broadcast_campaign_name || "Smartflo Inbound"),
-              sourceName: callerDid || "Smartflo Pilot DID",
-              source: didInfo?.source || "Telephony",
-              subStatus: "Fresh Lead",
-              leadStage: "Fresh Lead",
-              leadValidStatus: "Valid",
-              centreLocation: "Noida Sector 62",
-              centreAddress: "Seeds IVF Centre",
-              leadOwner: assignedOwnerName,
-              callerName: assignedOwnerName,
-              createdBy: matchedAgentUserId,
-              notes: `Auto-created via ${callSource} received on DID ${callerDid || "Pilot"} assigned to extension ${agentNumber || "unassigned"}.`,
-              date: todayDate,
-              dateOfLead: todayDate,
-              month: currentMonth,
-              leadTimestamp: currentTimestamp,
-              assignedDate: todayDate,
-              assignedAt: new Date().toISOString(),
-              auditLogs: [
-                {
-                  performedBy: assignedOwnerName,
-                  performedByRole: "agent",
-                  performedByEmail: "dialer@smartflo.crm",
-                  timestamp: new Date().toISOString(),
-                  changes: [
-                    {
-                      field: "created",
-                      fieldLabel: "Auto Lead Creation",
-                      oldValue: "",
-                      newValue: `Lead auto-created from ${callSource} (${customerNumber}) assigned to ${assignedOwnerName}`,
-                    },
-                  ],
-                },
-              ],
-            });
-
-            matchedLead = newLeadDoc;
-            matchingMethod = "phone_primary";
-            console.info(
-              `[Smartflo Webhook] Auto-created new Lead ${autoUniqueId} (id: ${newLeadDoc._id}) for phone ${customerNumber} assigned to ${assignedOwnerName} (callId: ${callId})`
-            );
-          } catch (createErr: any) {
-            console.error(
-              `[Smartflo Webhook] Lead.create failed for callId=${callId}, phone=${normalizedPhone.slice(-4).padStart(normalizedPhone.length, "*")}, uniqueId=${autoUniqueId}: ${createErr.message}`,
-              createErr
-            );
-            // Check if failure was duplicate key error where another worker created it
-            const duplicateCheck = await Lead.findOne({
-              $or: [
-                { normalizedPhone: normalizedPhone },
-                { primaryMobileNumber: normalizedPhone },
-                { uniqueId: autoUniqueId },
-              ],
-            });
-            if (duplicateCheck) {
-              matchedLead = duplicateCheck;
-              matchingMethod = "phone_primary";
-            }
-          }
-        }
+        matchedLead = newLeadDoc;
+        matchingMethod = "phone_primary";
+        console.info(
+          `[Smartflo Webhook] Auto-created new Lead ${autoUniqueId} for phone ${customerNumber} assigned to ${assignedOwnerName}`
+        );
       }
-    } catch (lockErr: any) {
-      console.error(
-        `[Smartflo Webhook] Unexpected error during auto-lead lock handling for callId=${callId}, phone=${normalizedPhone.slice(-4).padStart(normalizedPhone.length, "*")}: ${lockErr.message}`
-      );
+    } catch (createErr: any) {
+      console.warn(`[Smartflo Webhook] Auto lead creation conflict or notice: ${createErr.message}`);
       const fallbackCheck = await Lead.findOne({
         $or: [
           { normalizedPhone: normalizedPhone },
@@ -913,7 +791,7 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
   // Smartflo terminal indicators:
   // - Event name: "call_hangup", "hangup", "call hangup", "completed", "ended", "call_ended", "call:ended"
   // - Telephony indicators: hangup_cause, hangup_cause_code, hangup_cause_description
-  // - End timestamps: EndTime, end_stamp, or post-call recordingUrl
+  // - Durations: duration > 0, billsec > 0, CallDuration > 0
   const eventName = String(
     payload.event ?? payload.event_type ?? payload.trigger ?? payload.webhook_event ?? ""
   ).toLowerCase().trim();
@@ -936,22 +814,19 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     rawHangupCause.toLowerCase() !== "none"
   );
 
-  const hasEndTimestampOrRecording = !!(payload.EndTime || payload.end_stamp || recordingUrl);
-
-  const isLiveAnsweredEvent = (
-    eventName.includes("answered") ||
-    eventName.includes("picked") ||
-    (status === "answered" && !hasHangupEventName && !hasHangupCause && !hasEndTimestampOrRecording)
+  const hasTerminalDuration = (
+    parseSafeDuration(payload.duration) > 0 ||
+    parseSafeDuration(payload.billsec) > 0 ||
+    parseSafeDuration(payload.CallDuration) > 0 ||
+    parseSafeDuration(payload.answered_duration) > 0
   );
 
-  // A webhook is definitively terminal if:
-  // 1. It carries an explicit hangup/completion event name, OR
-  // 2. It carries a genuine hangup cause description (e.g. NORMAL_CLEARING, ORIGINATOR_CANCEL), OR
-  // 3. It carries an explicit end timestamp/recordingUrl while NOT being an in-flight live answer event.
-  const isTerminalHangup = !isLiveAnsweredEvent && (
+  // A webhook is definitively terminal if it has hangup event name, hangup cause description,
+  // or terminal durations with an end timestamp or recording URL.
+  const isTerminalHangup = (
     hasHangupEventName ||
     hasHangupCause ||
-    (hasEndTimestampOrRecording && status !== "in_progress")
+    (hasTerminalDuration && !!(payload.EndTime || payload.end_stamp || recordingUrl))
   );
 
   const isDialedOnAgent = eventName.includes("dialed") || (eventName.includes("agent") && eventName.includes("dial"));
@@ -1167,19 +1042,15 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
     }
   } else {
     // Outbound Call Lifecycle Synchronization:
-    // Support outbound ringing, answered/connected, and terminal ended events.
-    const targetUserIdStr = finalAgentUserId ? finalAgentUserId.toString() : undefined;
-    const outboundLeadId = matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined);
-    const outboundLeadUniqueId = matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined);
-
-    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status) && isTerminalHangup;
-
+    // When customer disconnects or call finishes (answered/completed/missed/failed),
+    // broadcast terminal events to clear active call states across CRM clients.
+    const isTerminal = ["answered", "missed", "completed", "ended", "failed", "busy", "no_answer"].includes(status);
     if (isTerminal) {
       const callEndedPayload: CallEndedNotification = {
         callId,
         refId: updateData.refId || existingRecord?.refId || undefined,
-        leadId: outboundLeadId,
-        leadUniqueId: outboundLeadUniqueId,
+        leadId: matchedLead?._id?.toString() || (externalLeadId ? String(externalLeadId) : undefined),
+        leadUniqueId: matchedLead?.uniqueId || (externalLeadId.startsWith("SOI-") ? externalLeadId : undefined),
         customerNumber,
         status: status === "answered" ? "answered" : status === "missed" ? "missed" : "ended",
         durationSeconds: finalTotalDuration,
@@ -1187,58 +1058,10 @@ export async function processSmartfloWebhook(payload: SmartfloWebhookPayload): P
       };
 
       console.info(
-        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
+        `[Smartflo Webhook] Emitting outbound:ended for callId=${callId}, refId=${callEndedPayload.refId}, lead=${callEndedPayload.leadUniqueId}`
       );
-      broadcastCallEndedEvent("outbound:ended", callEndedPayload, targetUserIdStr);
-      broadcastCallEndedEvent("call:ended", callEndedPayload, targetUserIdStr);
-    } else if (status === "answered" && !isTerminalHangup) {
-      // In-flight answered: agent & customer connected
-      const answeredNotification: OutboundCallNotification = {
-        callId,
-        refId: updateData.refId || existingRecord?.refId || undefined,
-        leadId: outboundLeadId,
-        leadUniqueId: outboundLeadUniqueId,
-        customerNumber,
-        status: "answered",
-        durationSeconds: finalAnsweredDuration,
-        timestamp: (startTime || new Date()).toISOString(),
-      };
-      console.info(
-        `[Smartflo Webhook] Emitting outbound:answered for connected callId=${callId}, refId=${answeredNotification.refId}, lead=${answeredNotification.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
-      );
-      broadcastOutboundCallEvent("outbound:answered", answeredNotification, targetUserIdStr);
-    } else if (status === "in_progress" || isDialedOnAgent) {
-      // Agent is ringing / waiting
-      const ringingNotification: OutboundCallNotification = {
-        callId,
-        refId: updateData.refId || existingRecord?.refId || undefined,
-        leadId: outboundLeadId,
-        leadUniqueId: outboundLeadUniqueId,
-        customerNumber,
-        status: "ringing",
-        timestamp: (startTime || new Date()).toISOString(),
-      };
-      console.info(
-        `[Smartflo Webhook] Emitting outbound:ringing for callId=${callId}, refId=${ringingNotification.refId}, lead=${ringingNotification.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
-      );
-      broadcastOutboundCallEvent("outbound:ringing", ringingNotification, targetUserIdStr);
-    } else if (["missed", "failed", "busy", "no_answer"].includes(status)) {
-      // Unanswered or rejected outbound call
-      const failedPayload: CallEndedNotification = {
-        callId,
-        refId: updateData.refId || existingRecord?.refId || undefined,
-        leadId: outboundLeadId,
-        leadUniqueId: outboundLeadUniqueId,
-        customerNumber,
-        status: status === "missed" ? "missed" : "failed",
-        durationSeconds: finalTotalDuration,
-        timestamp: (endTime || new Date()).toISOString(),
-      };
-      console.info(
-        `[Smartflo Webhook] Emitting outbound:ended (failed/missed) for callId=${callId}, lead=${failedPayload.leadUniqueId}, targetUser=${targetUserIdStr || "global"}`
-      );
-      broadcastCallEndedEvent("outbound:ended", failedPayload, targetUserIdStr);
-      broadcastCallEndedEvent("call:ended", failedPayload, targetUserIdStr);
+      broadcastCallEndedEvent("outbound:ended", callEndedPayload);
+      broadcastCallEndedEvent("call:ended", callEndedPayload);
     }
   }
 
