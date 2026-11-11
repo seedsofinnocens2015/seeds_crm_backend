@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import mongoose from "mongoose";
+import crypto from "node:crypto";
 import { config } from "../config/env.js";
 import { Lead } from "../models/Lead.js";
 import { User } from "../models/User.js";
@@ -54,20 +55,59 @@ export function verifySmartfloPullAuth(req: Request): boolean {
  * Receives call event notifications from Smartflo.
  */
 export async function handleSmartfloWebhook(req: Request, res: Response) {
+  const reqId = crypto.randomUUID().slice(0, 8);
+  const method = req.method;
+  const reqPath = req.originalUrl || req.url || req.path;
+  const contentType = req.headers["content-type"] || "none";
+  const hasAuthHeader = !!req.headers["authorization"];
+  const hasWebhookSecretHeader = !!req.headers["x-webhook-secret"];
+  const hasApiKeyHeader = !!req.headers["x-api-key"];
+  const hasSecretHeader = !!req.headers["secret"];
+  const hasBody = !!(req.body && typeof req.body === "object");
+  const payloadKeys = hasBody ? Object.keys(req.body) : [];
+
+  console.info(
+    `[Smartflo Webhook Entry] Request received [reqId=${reqId}]: method=${method}, path=${reqPath}, contentType=${contentType}, hasAuthorization=${hasAuthHeader}, hasXWebhookSecret=${hasWebhookSecretHeader}, hasXApiKey=${hasApiKeyHeader}, hasSecret=${hasSecretHeader}, hasBody=${hasBody}, bodyKeys=[${payloadKeys.join(", ")}]`
+  );
+
   try {
     const authStatus = verifySmartfloWebhookAuth(req);
     if (authStatus === "unconfigured") {
+      console.error(
+        `[Smartflo Webhook Auth] Authentication failed [reqId=${reqId}]: category=unconfigured, status=500`
+      );
       return res.status(500).json({
         error: "Server configuration error: Webhook authentication secret is not configured.",
       });
     }
     if (authStatus === "unauthorized") {
+      console.warn(
+        `[Smartflo Webhook Auth] Authentication failed [reqId=${reqId}]: category=unauthorized, status=401`
+      );
       return res.status(401).json({ error: "Unauthorized webhook request" });
     }
 
+    console.info(
+      `[Smartflo Webhook Auth] Authentication successful [reqId=${reqId}]`
+    );
+
     const payload = req.body;
     if (!payload || typeof payload !== "object") {
+      console.warn(
+        `[Smartflo Webhook Payload] Malformed payload received [reqId=${reqId}]: body is not a valid object, status=400`
+      );
       return res.status(400).json({ error: "Invalid JSON payload" });
+    }
+
+    const rawCallId = payload.CallSessionId ?? payload.call_id ?? payload.callId;
+    if (rawCallId === undefined || rawCallId === null || String(rawCallId).trim() === "") {
+      console.warn(
+        `[Smartflo Webhook Payload] Missing call ID [reqId=${reqId}]: availableKeys=[${payloadKeys.join(", ")}], status=400`
+      );
+      return res.status(400).json({
+        error: "Missing mandatory 'call_id' in webhook payload.",
+        availableKeys: payloadKeys,
+      });
     }
 
     const result = await processSmartfloWebhook(payload);
@@ -81,7 +121,7 @@ export async function handleSmartfloWebhook(req: Request, res: Response) {
       message: result.message,
     });
   } catch (error: any) {
-    console.error("[Smartflo Webhook Error]:", error.message);
+    console.error(`[Smartflo Webhook Error] [reqId=${reqId}]:`, error.message);
     return res.status(500).json({
       status: "error",
       message: error.message || "Failed to process call webhook",
