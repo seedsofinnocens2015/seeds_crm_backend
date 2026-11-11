@@ -62,11 +62,13 @@ export async function login(req: Request, res: Response) {
       { expiresIn: "7d" }
     );
 
-    // Set secure HTTP-only cookie
+    // Set secure HTTP-only cookie with cross-domain support in production
+    const isProd = config.nodeEnv === "production" || process.env.NODE_ENV === "production";
     res.cookie(COOKIE_NAME, token, {
       httpOnly: true,
-      secure: config.nodeEnv === "production",
-      sameSite: "lax",
+      secure: isProd,
+      sameSite: isProd ? "none" : "lax",
+      ...(isProd ? { domain: ".seedsofinnocens.com" } : {}),
       maxAge: SEVEN_DAYS_MS,
       path: "/",
     });
@@ -157,8 +159,12 @@ export async function getMe(req: Request, res: Response) {
  * Clears authentication cookie.
  */
 export async function logout(req: Request, res: Response) {
+  const isProd = config.nodeEnv === "production" || process.env.NODE_ENV === "production";
   res.clearCookie(COOKIE_NAME, {
     httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+    ...(isProd ? { domain: ".seedsofinnocens.com" } : {}),
     path: "/",
   });
   return res.status(200).json({ message: "Logged out successfully" });
